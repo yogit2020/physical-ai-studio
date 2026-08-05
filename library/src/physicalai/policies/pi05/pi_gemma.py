@@ -137,7 +137,10 @@ class PiGemmaRMSNorm(nn.Module):
         if cond.shape[-1] != self.cond_dim:
             msg = f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}"
             raise ValueError(msg)
-        modulation = self.dense(cond)
+        # cond (adarms conditioning) arrives as float32 on the inference path while
+        # dense.weight is bfloat16 under bf16-true, which raises "mat1 and mat2 must
+        # have the same dtype". Align cond with the layer weight.
+        modulation = self.dense(cond.to(self.dense.weight.dtype))
         if len(x.shape) == 3:  # noqa: PLR2004
             modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)

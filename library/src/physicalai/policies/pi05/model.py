@@ -853,7 +853,12 @@ class Pi05Model(Model):
         pad_masks.append(masks)
         att_masks += [0] * lang_emb.shape[1]
 
-        embs_cat = torch.cat(embs, dim=1)
+        # embed_image() returns features in the *input* image dtype, which is
+        # float32 at inference (the export manifest declares float32 images),
+        # while the language embedding layer emits the model dtype. Concatenating
+        # the two and feeding bf16-true PaliGemma weights raises
+        # "mat1 and mat2 must have the same dtype". Normalise on the model dtype.
+        embs_cat = torch.cat([emb.to(self.action_in_proj.weight.dtype) for emb in embs], dim=1)
         pad_masks_cat = torch.cat(pad_masks, dim=1)
         att_masks_t = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks_cat.device)
         att_masks_t = att_masks_t[None, :].expand(bsize, len(att_masks))
