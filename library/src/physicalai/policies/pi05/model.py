@@ -1325,9 +1325,16 @@ class Pi05Model(Model):
         bsize = tokens.shape[0]
         device = tokens.device
 
+        # Match the model dtype: with bf16-true the projections are bfloat16, but
+        # sample_noise()/time tensors are built as float32. The training path
+        # rebases them off actions.dtype; inference has no action tensor, so read
+        # the dtype off the projection weight instead.
+        model_dtype = self.action_in_proj.weight.dtype
+
         if noise is None:
             actions_shape = (bsize, self._chunk_size, self._max_action_dim)
             noise = self.sample_noise(actions_shape, device)
+        noise = noise.to(dtype=model_dtype)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = _make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1349,8 +1356,10 @@ class Pi05Model(Model):
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
-            target_time = torch.zeros(bsize, device=device) if self._snapflow_enabled else time_tensor
+            time_tensor = torch.tensor(time, dtype=model_dtype, device=device).expand(bsize)
+            target_time = (
+                torch.zeros(bsize, device=device, dtype=model_dtype) if self._snapflow_enabled else time_tensor
+            )
 
             v_t = self.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
