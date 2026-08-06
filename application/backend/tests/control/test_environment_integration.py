@@ -87,6 +87,38 @@ class TestInferenceEnvironmentIntegration:
         expected = [unique_values[k] for k in action_keys]
         np.testing.assert_array_equal(result.state[0], expected)
 
+    def test_model_input_images_follow_camera_name_order_not_db_order(
+        self, inference_environment_integration: EnvironmentIntegration, event_loop
+    ):
+        """Image slots must be ordered by camera name, matching dataset feature order.
+
+        Policies like Pi0.5 stack images positionally and drop the names, so a
+        mismatch here feeds each camera into the slot the other one trained as.
+        The fixture lists "grabber" before "front" in database order, which is
+        the reverse of their sorted order — so iterating the raw list would put
+        the wrong camera in slot 0.
+        """
+        observation = event_loop.run_until_complete(inference_environment_integration.get_observation())
+        assert observation is not None
+
+        result = inference_environment_integration.format_model_input_observation(observation)
+
+        assert list(result.images.keys()) == ["front", "grabber"]
+
+    def test_dataset_image_features_follow_camera_name_order(
+        self, inference_environment_integration: EnvironmentIntegration
+    ):
+        """Recorded datasets must declare image features in the same canonical order.
+
+        Training reads slot order from these feature names, so recording in a
+        different order than inference builds its inputs would reintroduce the
+        same crossed-inputs bug for every dataset captured here.
+        """
+        features = inference_environment_integration.build_lerobot_dataset_features()
+
+        image_keys = [key for key in features if key.startswith("observation.images.")]
+        assert image_keys == ["observation.images.front", "observation.images.grabber"]
+
     def test_transform_observation_to_report_to_ui(
         self, inference_environment_integration: EnvironmentIntegration, event_loop
     ):

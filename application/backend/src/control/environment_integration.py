@@ -34,6 +34,24 @@ class EnvironmentIntegration:
         self.robot_client_factory = robot_client_factory
         self.frame_captures = {}
 
+    @property
+    def ordered_cameras(self) -> list[Camera]:
+        """Cameras in the canonical order used to build policy image inputs.
+
+        Policies that take images as a positional stack (Pi0.5 among them)
+        discard camera names entirely: the export records only a camera
+        *count*, and the preprocessor consumes ``images.values()`` in dict
+        insertion order. Slot order is therefore the only thing tying a
+        camera to the input it trained as, and it has to match the order the
+        training dataset declared its ``observation.images.*`` features in.
+
+        LeRobot writes those features sorted by name, so sorting here makes
+        both paths agree. Iterating ``environment.cameras`` instead would
+        follow database row order, which is unrelated to the dataset's order
+        and silently feeds each camera into the wrong slot.
+        """
+        return sorted(self.environment.cameras, key=lambda camera: camera.name.lower())
+
     async def setup(self) -> None:
         try:
             robot = self.environment.robots[0]  # TODO: Handle multiple robots?
@@ -84,7 +102,7 @@ class EnvironmentIntegration:
             action_features[feature] = float
             observation_features[feature] = float
 
-        for camera in self.environment.cameras:
+        for camera in self.ordered_cameras:
             observation_features[camera.name.lower()] = self._get_camera_features(camera)
 
         return combine_feature_dicts(
@@ -146,7 +164,7 @@ class EnvironmentIntegration:
         observation = self._remap_camera_observations(raw_observation)
         state = np.array([[observation[k] for k in self.action_keys]], dtype=np.float32)
         images: dict = {}
-        for camera in self.environment.cameras:
+        for camera in self.ordered_cameras:
             camera_name = camera.name.lower()
             # SWAP HWC, RGB2BGR and in float 0..1 range.
             images[camera_name] = np.ascontiguousarray(
