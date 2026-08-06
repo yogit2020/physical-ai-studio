@@ -70,6 +70,14 @@ x-common: &common
     volumes:
       - physical-ai-studio-data:/app/data
       - physical-ai-studio-storage:/app/storage
+      # udev's stable camera-ID tree. The container's /dev is a private
+      # tmpfs holding only the bare /dev/videoN nodes, so without this the
+      # capture layer sees no stable identifier and falls back to the raw
+      # V4L2 index. Indices are assigned in probe order, so a replug can
+      # swap which camera an index denotes -- and a saved environment then
+      # feeds each policy input the wrong camera. Mounting by-id/by-path
+      # lets discovery persist a replug-stable path instead.
+      - /dev/v4l:/dev/v4l:ro
 
     # --- Option 1: Privileged mode (active by default)
     # Grants full access to all host devices. Easiest setup, but the
