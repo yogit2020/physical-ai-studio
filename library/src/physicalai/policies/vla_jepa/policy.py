@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -156,6 +157,7 @@ class VlaJepa(ExportablePolicyMixin, Policy):
 
         self.model: VlaJepaModel | None = None
         self._dataset_stats = dataset_stats
+        self._action_steps: int | None = None  # resolved lazily; see _executed_action_steps
 
         if dataset_stats is not None:
             self._build_model(dataset_stats)
@@ -321,6 +323,35 @@ class VlaJepa(ExportablePolicyMixin, Policy):
             return self.model(model_batch)
         return self.predict_action_chunk(batch)
 
+    def _executed_action_steps(self) -> int:
+        """How many chunk steps to emit at inference, clamped to ``chunk_size``.
+
+        ``PHYSICALAI_ACTION_STEPS`` overrides ``n_action_steps`` so the executed
+        horizon can be retuned without re-exporting the checkpoint.
+        """
+        if self._action_steps is not None:
+            return self._action_steps
+
+        steps = self.config.n_action_steps
+        raw = os.environ.get("PHYSICALAI_ACTION_STEPS")
+        if raw is not None:
+            try:
+                steps = int(raw)
+            except ValueError:
+                logger.warning("Ignoring non-integer PHYSICALAI_ACTION_STEPS=%r", raw)
+
+        clamped = max(1, min(steps, self.config.chunk_size))
+        if clamped != steps:
+            logger.warning(
+                "Requested %d action steps but chunk_size is %d — clamped to %d",
+                steps,
+                self.config.chunk_size,
+                clamped,
+            )
+
+        self._action_steps = clamped
+        return clamped
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: Observation) -> torch.Tensor:
         if self.model is None:
@@ -328,7 +359,17 @@ class VlaJepa(ExportablePolicyMixin, Policy):
             raise RuntimeError(msg)
 
         model_batch = self._obs_to_model_batch(batch)
-        return self.model.predict_action_chunk(model_batch)
+        actions = self.model.predict_action_chunk(model_batch)
+
+        # The deployment path calls the policy directly (inference/adapters/pytorch.py
+        # does `self._policy(observation)` on an eval()-mode module), so
+        # Policy.select_action — and with it the n_action_steps action queue — never
+        # runs and the full chunk is emitted regardless of n_action_steps. Truncate
+        # here instead, which is what the backend queue mixer actually consumes.
+        steps = self._executed_action_steps()
+        if steps >= self.config.chunk_size:
+            return actions
+        return actions[:, :steps] if actions.dim() == 3 else actions[:steps]  # noqa: PLR2004
 
     # ------------------------------------------------------------------
     # Lightning hooks

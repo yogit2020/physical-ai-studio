@@ -23,8 +23,9 @@ model:
     # SO-ARM 101: 6 DOF (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
     action_dim: 6
     state_dim: 6
-    chunk_size: 7
-    n_action_steps: 1
+    # 50 @ 30 fps = 1.67 s horizon, well clear of the ~0.25 s inference latency
+    chunk_size: 50
+    n_action_steps: 50
 
     # V-JEPA frame count: 8 is safe on 32 GB XPU (model trained on 64)
     num_frames: 8
