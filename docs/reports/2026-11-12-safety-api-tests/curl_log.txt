@@ -1,0 +1,70 @@
+### 1. Pi0.5  GET /info
+$ curl http://172.18.0.1:18765/info
+{"host": "729ce1d9d9d6", "export_dir": "/models/exports/openvino", "backend": "openvino", "device": "GPU", "fingerprint": "63347f77df2428cf1a1b486a535fc81329d66713d4f44aea51b987d240097546"}
+  -> HTTP 200  connect 0.000093s  first byte 0.007123s  total 0.007137s  sent 0 B
+
+### Pi0.5  POST /predict  (run 1)
+$ curl -X POST http://172.18.0.1:18765/predict -H 'Content-Type: application/json' -d @pi_body.json
+
+  -> HTTP 200  connect 0.000125s  first byte 0.116441s  total 0.116505s  sent 165191 B
+  -> server infer_ms 96.2; chunk 50 x 6; first action [-4.97, -46.75, 36.76, 43.02, -50.3, 50.4]
+
+### Pi0.5  POST /predict  (run 2)
+$ curl -X POST http://172.18.0.1:18765/predict -H 'Content-Type: application/json' -d @pi_body.json
+
+  -> HTTP 200  connect 0.000104s  first byte 0.086751s  total 0.086795s  sent 165191 B
+  -> server infer_ms 66.5; chunk 50 x 6; first action [-4.97, -46.73, 36.76, 43.02, -50.3, 50.39]
+
+### Pi0.5  POST /predict  (run 3)
+$ curl -X POST http://172.18.0.1:18765/predict -H 'Content-Type: application/json' -d @pi_body.json
+
+  -> HTTP 200  connect 0.000085s  first byte 0.085264s  total 0.085367s  sent 165191 B
+  -> server infer_ms 66.5; chunk 50 x 6; first action [-4.97, -46.75, 36.76, 43.02, -50.3, 50.4]
+
+### Pi0.5  POST /predict  (run 4)
+$ curl -X POST http://172.18.0.1:18765/predict -H 'Content-Type: application/json' -d @pi_body.json
+
+  -> HTTP 200  connect 0.000084s  first byte 0.089629s  total 0.089703s  sent 165191 B
+  -> server infer_ms 66.7; chunk 50 x 6; first action [-4.97, -46.74, 36.76, 43.02, -50.3, 50.4]
+
+### Pi0.5  POST /predict  (run 5)
+$ curl -X POST http://172.18.0.1:18765/predict -H 'Content-Type: application/json' -d @pi_body.json
+
+  -> HTTP 200  connect 0.000090s  first byte 0.084003s  total 0.084129s  sent 165191 B
+  -> server infer_ms 65.5; chunk 50 x 6; first action [-4.97, -46.74, 36.76, 43.02, -50.3, 50.4]
+
+### Qwen  POST /v1/chat/completions  (hand in view, run 1)
+$ curl -X POST http://172.18.0.1:18766/v1/chat/completions -H 'Content-Type: application/json' -d @qw_body.json
+
+  -> HTTP 200  connect 0.000108s  first byte 0.989377s  total 0.989477s  sent 40895 B
+  -> answer UNSAFE_HAND  confidence 0.977  (top first tokens: UN=0.977, SAFE=0.023, UNS=0.000)  tokens in 551 out 4
+
+### Qwen  POST /v1/chat/completions  (hand in view, run 2)
+$ curl -X POST http://172.18.0.1:18766/v1/chat/completions -H 'Content-Type: application/json' -d @qw_body.json
+
+  -> HTTP 200  connect 0.000077s  first byte 1.142191s  total 1.142253s  sent 40895 B
+  -> answer UNSAFE_HAND  confidence 0.977  (top first tokens: UN=0.977, SAFE=0.023, UNS=0.000)  tokens in 551 out 4
+
+### Qwen  POST /v1/chat/completions  (hand in view, run 3)
+$ curl -X POST http://172.18.0.1:18766/v1/chat/completions -H 'Content-Type: application/json' -d @qw_body.json
+
+  -> HTTP 200  connect 0.000075s  first byte 0.808411s  total 0.808498s  sent 40895 B
+  -> answer UNSAFE_HAND  confidence 0.977  (top first tokens: UN=0.977, SAFE=0.023, UNS=0.000)  tokens in 551 out 4
+
+### Qwen  POST /v1/chat/completions  (old July scene, black mat, run 1)
+$ curl -X POST http://172.18.0.1:18766/v1/chat/completions -H 'Content-Type: application/json' -d @qw_body.json
+
+  -> HTTP 200  connect 0.000105s  first byte 0.742929s  total 0.742967s  sent 70367 B
+  -> answer SAFE  confidence 0.892  (top first tokens: SAFE=0.892, UN=0.107, SA=0.001)  tokens in 551 out 2
+
+### Qwen  POST /v1/chat/completions  (old July scene, black mat, run 2)
+$ curl -X POST http://172.18.0.1:18766/v1/chat/completions -H 'Content-Type: application/json' -d @qw_body.json
+
+  -> HTTP 200  connect 0.000088s  first byte 0.723986s  total 0.724058s  sent 70367 B
+  -> answer SAFE  confidence 0.892  (top first tokens: SAFE=0.892, UN=0.107, SA=0.001)  tokens in 551 out 2
+
+### Qwen  POST /v1/chat/completions  (old July scene, black mat, run 3)
+$ curl -X POST http://172.18.0.1:18766/v1/chat/completions -H 'Content-Type: application/json' -d @qw_body.json
+
+  -> HTTP 200  connect 0.000078s  first byte 0.725155s  total 0.725303s  sent 70367 B
+  -> answer SAFE  confidence 0.892  (top first tokens: SAFE=0.892, UN=0.107, SA=0.001)  tokens in 551 out 2

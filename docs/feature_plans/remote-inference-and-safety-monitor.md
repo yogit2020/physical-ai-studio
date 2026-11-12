@@ -76,6 +76,122 @@ does not fit.
 Pi0.5 and Qwen run concurrently and independently: the policy never waits for a safety check, and a
 slow or failed check never delays an action. The only coupling is the stop.
 
+### 3.1 How it works, in plain words
+
+Two AI models run side by side on the B70. Studio talks to both over an SSH tunnel.
+
+| | **Pi0.5** (the driver) | **Qwen** (the safety watcher) |
+|---|---|---|
+| Model | Pi0.5 "210base 65ft", OpenVINO export | `Qwen3.6-27B-int4-AutoRound`, served as `qwen-safety` by vLLM |
+| Runs on | B70 GPU 1, port `18765` | B70 GPU 0, port `18766` |
+| Gets | joint state + 2 camera images + task text | 2 camera images (448 px) + scene prompt |
+| Returns | 50 joint targets (an action chunk) | one word: `SAFE`, `UNSAFE_HAND` or `UNSAFE_OBJECT` |
+| How often | when the action queue runs out (~1 per second) | twice a second (2 Hz) |
+| Inference time (on GPU) | **66–72 ms** | ~0.35 s prefill + 2–4 tokens |
+| Latency seen by Studio | **~100 ms** (mean 100, p50 92 ms, 49 live calls) | **~0.43 s** (429–503 ms) |
+
+Measured on 2026-11-12; see `docs/reports/2026-11-12-safety-api-tests.md`.
+
+### 3.2 Flow: what the AI decides, and what happens next
+
+```mermaid
+flowchart LR
+    CAM["📷 Cameras<br/>arm-camera + topview"]
+
+    subgraph PI["Pi0.5 · drives the arm"]
+        P1["POST /predict"] --> P2["50 joint targets"]
+    end
+
+    subgraph QW["Qwen · watches, 2× per second"]
+        Q1["POST /v1/chat/completions"] --> Q2{"Answer?"}
+    end
+
+    CAM --> P1
+    CAM --> Q1
+    P2 --> ARM["🦾 ACTION: arm moves"]
+
+    Q2 -- "SAFE" --> OK["ACTION: nothing, keep going"]
+    Q2 -- "UNSAFE_HAND / UNSAFE_OBJECT<br/>confidence ≥ 0.6" --> STOP
+    Q2 -- "no answer for 2 s" --> STOP
+    EXT["Script / button / other model<br/>POST /safety/stop"] --> STOP
+
+    STOP["🛑 ACTION: stop Pi0.5<br/>+ glide arm home<br/>+ latch"] --> AGAIN{"Hazard still<br/>there while<br/>moving home?"}
+    AGAIN -- "yes" --> FREEZE["ACTION: freeze where it is"]
+    AGAIN -- "no" --> HOME["ACTION: arm reaches home"]
+
+    FREEZE --> ACK
+    HOME --> ACK
+    ACK["👤 Person clears the area<br/>POST /safety/acknowledge"] --> PLAY["Press Play again"]
+    PLAY --> P1
+
+    style STOP fill:#ffe3e3,stroke:#d13f3f
+    style FREEZE fill:#ffe3e3,stroke:#d13f3f
+    style OK fill:#e3f7e8,stroke:#2f9e4f
+    style HOME fill:#e3f7e8,stroke:#2f9e4f
+    style ACK fill:#fff6d6,stroke:#c99a00
+    style PLAY fill:#fff6d6,stroke:#c99a00
+```
+
+Three rules:
+
+1. **Pi0.5 never waits for Qwen.** A slow safety check delays the next check, never the arm.
+2. **If the hazard is still there while the arm goes home, the arm freezes.** It does not finish
+   homing on its own; send it with `POST /safety/home/go` once the area is clear.
+3. **Only a person clears a stop, and clearing it does not restart anything.** Play is refused
+   (`safety_latched`) until `acknowledge` is called.
+
+### 3.3 The API calls, one by one
+
+Base URLs: Studio `http://localhost:7860/api/runtime/sessions/<session_id>`, Pi0.5
+`http://172.18.0.1:18765`, Qwen `http://172.18.0.1:18766/v1`. `application/backend/scripts/safety.sh` wraps the
+Studio calls (`./safety.sh status | stop | hold | ack | capture-home | go-home | monitor-on | events`).
+
+**Studio safety API** (what an operator or script calls):
+
+| Step | Call | What happens |
+|---|---|---|
+| 1. Set home | `POST /safety/home/capture` | Current arm position is saved as home |
+| 2. Turn on Qwen | `PUT /safety` with `{"monitor": {"enabled": true, ...}}` | Qwen starts checking at 2 Hz |
+| 3. Check | `GET /safety` | Latch state, home pose, monitor health, last verdict |
+| 4. Stop by hand | `POST /safety/stop` with `{"reason": "...", "source": "...", "hold": false}` | Same stop as Qwen's: policy stops, arm goes home, latch |
+| 5. Send home | `POST /safety/home/go` | Arm glides home (refused while the policy runs) |
+| 6. Clear | `POST /safety/acknowledge?source=operator` | Latch cleared; press Play to restart |
+| 7. Review | `GET /safety/events` and `GET /safety/events/<id>/frames/<camera>` | What stopped, when, and the image it saw |
+
+```bash
+S=http://localhost:7860/api/runtime/sessions/<session_id>
+curl -X POST $S/safety/home/capture
+curl -X POST $S/safety/stop -H 'Content-Type: application/json' \
+     -d '{"reason": "test", "source": "safety.sh", "hazard": "other", "hold": false}'
+curl -X POST "$S/safety/acknowledge?source=operator"
+curl $S/safety
+```
+
+**Model APIs** (what Studio calls for you; shown so you can test each model alone):
+
+```bash
+# Pi0.5: which model is loaded (Studio checks the fingerprint before driving the arm)
+curl http://172.18.0.1:18765/info
+# -> {"backend": "openvino", "device": "GPU", "fingerprint": "63347f77…"}       7 ms
+
+# Pi0.5: one prediction. Images are base64 JPEG, keys "images.<camera>"
+curl -X POST http://172.18.0.1:18765/predict -H 'Content-Type: application/json' -d @pi_body.json
+#   pi_body.json = {"state": [[6 joints]], "images": {"images.topview": "<b64>", "images.arm-camera": "<b64>"},
+#                   "task": "Sort this item into the correct bin"}
+# -> {"action": [[50 x 6]], "infer_ms": 66.5}                                    85 ms total
+
+# Qwen: one safety check, one-word answer with its probability
+curl -X POST http://172.18.0.1:18766/v1/chat/completions -H 'Content-Type: application/json' -d @qw_body.json
+#   qw_body.json = {"model": "qwen-safety", "temperature": 0, "max_tokens": 6, "logprobs": true,
+#                   "structured_outputs": {"choice": ["SAFE", "UNSAFE_HAND", "UNSAFE_OBJECT"]},
+#                   "chat_template_kwargs": {"enable_thinking": false},
+#                   "messages": [{"role": "user", "content": [<2 images>, <scene prompt>]}]}
+# -> "content": "UNSAFE_HAND", first-token probability 0.977                       0.8–1.1 s*
+```
+
+\* Called by hand while the monitor was also checking twice a second, so the call queued behind it.
+The monitor's own checks take 0.43 s.
+
 ## 4. Components
 
 ### 4.1 Remote policy inference (`RemotePredictor`)
