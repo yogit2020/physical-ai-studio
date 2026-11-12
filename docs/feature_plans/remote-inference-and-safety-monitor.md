@@ -8,8 +8,12 @@ Run a robot task with two models on two accelerator cards of one remote machine:
 
 - **Pi0.5** drives the follower (the policy, card 1).
 - **Qwen** (vision-language model, card 0) watches the cameras while the policy runs. If it sees a
-  hazard — a hand or person in the workspace, a fallen object, an obstruction — it **stops the policy
-  and holds the arm** until a person acknowledges.
+  hazard it **stops the policy and returns the arm to its home position**, and the policy cannot
+  restart until a person acknowledges.
+
+**Hazard** (decided 2026-11-12): any hand or person, or **any object that is not part of the task
+scene**. The known scene is the arm itself, the coloured blocks, the bins and the table; anything else
+in either camera view is unsafe.
 
 The robot and cameras stay attached to the Studio machine. Both models run on the remote machine
 (an Arc Pro B70 DevCloud host with two 32 GB cards) and are reached over an SSH tunnel.
@@ -99,7 +103,11 @@ Loop, at `check_hz` (default 2 Hz; each check is skipped if the previous one is 
    ```json
    {"safe": false, "hazard": "hand_or_person", "confidence": 0.93, "reason": "hand above the red bin"}
    ```
-   `hazard` ∈ `none | hand_or_person | fallen_object | obstruction | other`.
+   `hazard` ∈ `none | hand_or_person | unknown_object`.
+
+   The prompt lists the known scene explicitly (arm, coloured blocks, bins, table) and asks for
+   `unsafe` on any hand, person, or anything else — an allow-list, not a list of hazards, so
+   unforeseen objects are caught. It can be overridden per session (`prompt`) for other scenes.
 4. Publish the verdict on the session bus (`evt/safety/verdict`).
 5. Decide (see 4.3) and, when it is a stop, request it from the session.
 
@@ -115,9 +123,25 @@ Stop when any of:
 - the monitor is **unhealthy** for longer than `fail_safe_after_s` (default 2 s): endpoint unreachable,
   timeouts, unparseable replies, or stale frames. Fail closed: an unwatched robot stops.
 
-The stop is the session's existing hold: `set_control(None)` joins the control and writes the
-follower's current state to `action`, so the arm **holds where it is** with torque on. The session
-does **not** `stop()` (that releases devices and parks the arm).
+The stop has two steps, both using what the session and robot worker already do:
+
+1. **Stop the policy** — `set_control(None)` joins the model control and writes the follower's current
+   state to `action`, so the arm stops where it is (torque on). This happens within one control tick.
+2. **Return home** — write the configured `home_pose` to `action` stamped `home_duration_s` (default 4 s)
+   in the future. The robot worker already approaches a future-stamped action linearly, so the arm
+   glides home at a bounded speed; no new robot code is needed.
+
+`on_stop` selects the behaviour: `home` (default, decided 2026-11-12) or `hold` (skip step 2).
+The session does **not** `stop()` (that releases devices).
+
+**Moving while a hazard is present.** Returning home means the arm moves while a hand or object may
+still be in the workspace. Mitigations:
+
+- The home pose is recorded by the operator (§5.1 `home/capture`) as a tucked pose clear of the
+  work area, and the move is slow (`home_duration_s`, and `max_joint_speed` caps it further).
+- The monitor keeps checking during the move. Another unsafe verdict, or `POST safety/stop` with
+  `"hold": true`, **freezes the arm where it is** (step 1 only) and stays frozen until acknowledged.
+- With no home pose recorded, `on_stop: home` falls back to `hold` and reports it in `health`.
 
 The **latch** then makes the stop stick:
 
@@ -133,8 +157,9 @@ The **latch** then makes the stop stick:
 - Acknowledging clears the latch but **does not resume** — the user presses Play again.
 - The latch lives on the `RuntimeSession`, so it covers every client (GUI, scripts) and every stop
   source (monitor, REST, future sources).
-- Stop latency budget: check interval + check duration + one control tick. At 2 Hz and ~1 s checks,
-  ~1.5 s worst case; at ~0.3 s checks (smaller model), ~0.8 s.
+- Stop latency budget (to the arm stopping, before it starts home): check interval + check duration
+  + one control tick. At 2 Hz and ~1 s checks, ~1.5 s worst case; at ~0.3 s checks (smaller model), ~0.8 s.
+  The return home then takes `home_duration_s`.
 
 ## 5. API
 
@@ -149,6 +174,8 @@ process-wide, not project-scoped — the same scope as the existing `POST /{sess
 | `PUT` | `/api/runtime/sessions/{session_id}/safety` | Enable/disable monitoring and set its config |
 | `POST` | `/api/runtime/sessions/{session_id}/safety/stop` | Stop the running model control and latch. For any external source |
 | `POST` | `/api/runtime/sessions/{session_id}/safety/acknowledge` | A person clears the latch; nothing resumes |
+| `POST` | `/api/runtime/sessions/{session_id}/safety/home/capture` | Record the follower's current position as the home pose |
+| `POST` | `/api/runtime/sessions/{session_id}/safety/home/go` | Move to the home pose now (manual; refused while a control runs) |
 | `GET` | `/api/runtime/sessions/{session_id}/safety/events` | Recent verdicts and stops, newest first (`?limit=`, `?stops_only=`) |
 | `GET` | `/api/runtime/sessions/{session_id}/safety/events/{event_id}/frames/{camera}` | JPEG that triggered a stop |
 | `GET` | `/api/runtime/sessions/{session_id}/cameras/{camera}/latest.jpg` | Newest frame, for external monitors that bring their own model |
@@ -157,8 +184,9 @@ process-wide, not project-scoped — the same scope as the existing `POST /{sess
 `POST .../safety/stop` body:
 
 ```json
-{ "reason": "light curtain tripped", "source": "plc-gateway", "hazard": "other" }
+{ "reason": "light curtain tripped", "source": "plc-gateway", "hazard": "unknown_object", "hold": false }
 ```
+`hold: true` freezes the arm instead of returning home (also used to interrupt a move home).
 Response `200` with the `SafetyStatus` below. Idempotent: stopping while latched returns the current
 status and records the extra event. `404` unknown session; `409` no environment loaded.
 
@@ -178,9 +206,15 @@ status and records the extra event. `404` unknown session; `409` no environment 
   "fail_safe_after_s": 2.0,
   "max_frame_age_s": 1.0,
   "stop_controls": ["model"],
+  "on_stop": "home",
+  "home_pose": [0.0, -95.0, 95.0, 70.0, 0.0, 2.0],
+  "home_duration_s": 4.0,
+  "max_joint_speed": 45.0,
   "prompt": null
 }
 ```
+`home_pose` is in the follower's joint units and order (`null` until captured; the values above are
+only an example). `max_joint_speed` (units/s) lengthens the move home if `home_duration_s` would be faster.
 `prompt: null` uses the built-in prompt. `400` for unknown cameras; the endpoint is probed and an
 unreachable endpoint is reported in `health`, not rejected (it may come up later).
 
@@ -189,7 +223,7 @@ unreachable endpoint is reported in `health`, not rejected (it may come up later
 ```json
 {
   "session_id": "…",
-  "state": "monitoring",            // disabled | monitoring | latched
+  "state": "monitoring",            // disabled | monitoring | latched | homing
   "health": "ok",                   // ok | degraded | down
   "config": { … },
   "last_verdict": { "at": "2026-11-12T20:15:03.120Z", "safe": true, "hazard": "none",
@@ -232,7 +266,9 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 
 | Failure | Behaviour |
 |---|---|
-| Qwen says unsafe | Hold + latch within one control tick of the verdict |
+| Qwen says unsafe | Policy stopped + latch within one control tick of the verdict, then arm returns home over `home_duration_s` |
+| Unsafe again while homing | Arm freezes where it is; stays latched |
+| No home pose recorded | Holds instead of homing; `health: degraded` until a pose is captured |
 | Qwen endpoint down / timeouts / bad JSON for > `fail_safe_after_s` | `health: down`, hold + latch (fail closed) |
 | Camera frozen (frame older than `max_frame_age_s`) | Treated as monitor unhealthy |
 | Tunnel drops during policy inference | `RemotePredictor` raises, model control ends, session holds (existing behaviour) |
@@ -277,7 +313,8 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 
 ## 11. Open questions
 
-- Hazard list and wording of the prompt — confirm with the operator; collect real hazard frames.
+- Prompt wording for the "anything not in the scene" rule — tune on real frames (hands, tools, a cup,
+  a phone, a sleeve at the edge of the view) to balance missed hazards against false stops.
 - Should a stop during teleop also latch (`stop_controls`)? Default: model only.
 - Acknowledge permissions: any client, or GUI only?
 - Keep remote-device config file-based, or move it into the database next to remote trainers?
