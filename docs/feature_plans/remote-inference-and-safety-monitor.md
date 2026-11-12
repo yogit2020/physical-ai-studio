@@ -32,7 +32,21 @@ the API, so the stop path is independent of Qwen.
 | Card | Model | Serving | Memory | Measured / expected |
 |---|---|---|---|---|
 | B70 GPU 1 (PCI 54:00.0) | Pi0.5 "210base 65ft", OpenVINO export | `remote_policy_server.py` | ~6.4 GB | 66–72 ms inference, **102 ms** end to end from Studio (live run, 2026-11-06) |
-| B70 GPU 0 (PCI 18:00.0) | `Intel/Qwen3.6-27B-int4-AutoRound` (vision kept bf16) | vLLM XPU, OpenAI API | 17.7 GiB weights, ≤75% of card | to be measured; estimate 1–1.5 s per check |
+| B70 GPU 0 (PCI 18:00.0) | `Intel/Qwen3.6-27B-int4-AutoRound` (vision kept bf16) | vLLM 0.32 XPU, OpenAI API | 17.7 GiB weights, 79% cap, 1.7 GiB KV | **494 ms** per check (p90 504 ms), one-word verdict (2026-11-12) |
+
+Measured 2026-11-12 on 30 normal frames of the sorting dataset (no hazards present):
+
+| Prompt / reply format | Mean | p90 | Normal frames flagged | Flagged at ≥ 0.6 |
+|---|---|---|---|---|
+| Generic allow-list, JSON + reason | 2363 ms | 2469 ms | 21/30 | 21 |
+| Scene-specific allow-list, JSON + reason | 2206 ms | 2342 ms | 2/30 | 2 |
+| Scene-specific, JSON without reason | 1568 ms | 1599 ms | 1/30 | 1 |
+| **Scene-specific, one word** | **494 ms** | **504 ms** | **1/30** | **0** |
+
+Pi0.5 on GPU 1 stayed at 64 ms per chunk (966 calls) while Qwen ran on GPU 0: no interference.
+Decode is ~35 ms/token, so output length dominates; prefill of two 448 px images + prompt (538 tokens)
+is ~0.35 s. vLLM must be started with `--max-model-len 4096 --mm-processor-kwargs '{"max_pixels": 200704}'`
+or its profiling leaves no KV cache on a card with the 6 GB baseline.
 
 Fallback monitor models if Qwen3.6-27B INT4 is too slow: `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.5-4B`.
 Each card carries ~6.2 GB of baseline driver usage, so ~25.7 GiB is usable per card; FP8 27B (28.7 GiB)
@@ -97,17 +111,27 @@ Loop, at `check_hz` (default 2 Hz; each check is skipped if the previous one is 
    (frozen camera), not a "safe" verdict.
 2. Downscale to `image_max_side` (default 448 px) and JPEG-encode — fewer image tokens, faster prefill.
 3. POST `/v1/chat/completions` to the monitor endpoint with the prompt, the images, `temperature: 0`,
-   thinking disabled (`chat_template_kwargs: {enable_thinking: false}`), and a JSON-schema
-   `response_format` so the reply is always parseable:
+   thinking disabled (`chat_template_kwargs: {enable_thinking: false}`), and a **one-word constrained
+   reply** — `structured_outputs: {choice: ["SAFE", "UNSAFE_HAND", "UNSAFE_OBJECT"]}` with
+   `logprobs`. Confidence is the probability of the reply's first token, so `P(unsafe) = 1 − P(SAFE)`.
+   This is ~4 output tokens instead of ~55 for JSON with a reason: 0.5 s per check instead of 2.3 s.
+   The verdict is mapped to the event shape:
 
    ```json
-   {"safe": false, "hazard": "hand_or_person", "confidence": 0.93, "reason": "hand above the red bin"}
+   {"safe": false, "hazard": "hand_or_person", "confidence": 0.93, "answer": "UNSAFE_HAND"}
    ```
-   `hazard` ∈ `none | hand_or_person | unknown_object`.
+   `hazard` ∈ `none | hand_or_person | unknown_object`. A free-text `reason` is not generated on the
+   hot path; when a stop fires, the monitor may ask once more with a JSON + reason prompt purely for the
+   event log (it does not delay the stop).
 
-   The prompt lists the known scene explicitly (arm, coloured blocks, bins, table) and asks for
-   `unsafe` on any hand, person, or anything else — an allow-list, not a list of hazards, so
-   unforeseen objects are caught. It can be overridden per session (`prompt`) for other scenes.
+   The prompt lists the known scene explicitly and asks for `unsafe` on any hand, person, or
+   anything else — an allow-list, not a list of hazards, so unforeseen objects are caught. It must
+   describe the **actual** cell, or normal things are flagged: with a generic list, 21/30 normal frames
+   were flagged (bin logos read as people, the tripod and wall behind the desk, the arm's own circuit
+   boards and wires). What fixed it: judge only the white mat and ignore everything beyond it; list the
+   arm's exposed electronics, the green TRASH bin and blue RECYCLE bin; and say that the wrist camera
+   sees bins, logos and blocks very close and cut off at the edges. The prompt is per session
+   (`prompt`) because it is specific to the cell.
 4. Publish the verdict on the session bus (`evt/safety/verdict`).
 5. Decide (see 4.3) and, when it is a stop, request it from the session.
 
@@ -313,8 +337,9 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 
 ## 11. Open questions
 
-- Prompt wording for the "anything not in the scene" rule — tune on real frames (hands, tools, a cup,
-  a phone, a sleeve at the edge of the view) to balance missed hazards against false stops.
+- Calibrate `min_confidence` on real hazard frames (hands, tools, a cup, a phone, a sleeve at the edge
+  of the view). On normal frames `P(unsafe)` reached up to 0.6, so 0.6 is the floor; the hazard set
+  decides how much higher it can go without missing hazards.
 - Should a stop during teleop also latch (`stop_controls`)? Default: model only.
 - Acknowledge permissions: any client, or GUI only?
 - Keep remote-device config file-based, or move it into the database next to remote trainers?
