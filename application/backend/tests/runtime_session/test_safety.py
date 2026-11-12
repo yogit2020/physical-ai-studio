@@ -8,7 +8,13 @@ import pytest
 
 from exceptions import RuntimeSessionCommandError
 from runtime_session.store import ACTION, STATE
-from schemas.runtime_session import ModelControlConfig, SafetyConfig, SafetyStopRequest, TeleopControlConfig
+from schemas.runtime_session import (
+    ModelControlConfig,
+    MonitorConfig,
+    SafetyConfig,
+    SafetyStopRequest,
+    TeleopControlConfig,
+)
 from tests.workers.fake_model import FakeModelWorker
 
 from .fixtures import make_environment
@@ -141,6 +147,19 @@ async def test_the_home_pose_is_kept_for_the_follower(new_session, fake_cameras)
     await later.load_environment(make_environment())
     assert later.safety_status().config.home_pose == pose
     assert later.state().safety.home_pose_set
+
+
+async def test_a_new_session_watches_with_the_followers_saved_monitor(new_session, fake_cameras) -> None:
+    session = await new_session()
+    await session.load_environment(make_environment())
+    await session.set_safety(SafetyConfig(monitor=MonitorConfig(enabled=True, endpoint="http://qwen.invalid/v1")))
+    await session.stop()
+
+    later = await new_session()
+    await later.load_environment(make_environment())
+    # No safety call yet: the monitor reads this config, so loading the environment must load it.
+    assert later._safety.config.monitor.enabled
+    assert later._safety.config.monitor.endpoint == "http://qwen.invalid/v1"
 
 
 async def test_going_home_by_hand(new_session, fake_cameras) -> None:

@@ -385,6 +385,9 @@ class RuntimeSession:
                 self._store = Store.create(description.spec, self.id)
             try:
                 await self._environment.load(self._loaded_environment(environment, description))
+                # The monitor reads the follower's saved config; without this a new session watches
+                # nothing until some safety call happens to load it.
+                self._use_follower_safety()
                 logger.info("Session {} loaded environment {!r}", self.id, environment.name)
             finally:
                 # Also when the load was refused: the dataset records from the store, which is there either way.
