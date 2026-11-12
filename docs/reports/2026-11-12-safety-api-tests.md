@@ -9,12 +9,17 @@ What we tested today, with the API calls, the model timings, and what we found. 
   Play, acknowledge, events, and stop frames.
 - **Qwen stopped the arm for a real hand.** Its confidence was 0.997, the arm started home, and when
   the hand was still there 0.5 s later the arm froze, as designed.
-- **Pi0.5 sorted the object with the Qwen monitor watching** (test 16, 23:32:05–23:32:19). Qwen did
+- **Pi0.5 sorted the object with the Qwen monitor watching** (test 17, 23:32:05–23:32:19). Qwen did
   not stop it once: no false stops.
+- **Later, Qwen made one false stop** (test 20): `UNSAFE_OBJECT` at 70% while the arm held a black
+  cube over the blue bin. The arm went home still holding the cube. A new scene prompt cuts false
+  stops on 101 dataset frame pairs from **5 to 1**, and still catches all 4 real hand stops (test 23).
+- **Bug found and fixed: a newly opened session did not run the monitor** until some safety call
+  happened (tests 21–22). A hand in view did not stop Pi0.5. Fixed in `runtime_session/session.py`.
 - **Pi0.5 took about 100 ms per call from Studio** (72 ms on the GPU), over 49 live calls in three
   runs and 5 direct `curl` calls.
 - **Qwen took 0.43 s per check** in the live monitor (429–503 ms over 12 sampled checks).
-- One bug fixed (`safety.sh` crashed on its status summary). Two things to watch: one false
+- Two bugs fixed (`safety.sh` crashed on its status summary; new sessions did not monitor). Two things to watch: one false
   `UNSAFE_OBJECT` just under the stop threshold, and the 30 Hz control loop missing a deadline on
   every Pi0.5 call.
 
@@ -52,6 +57,12 @@ arm goes home.
 | 15 | 23:28 | Live monitor latency | `GET /safety` ×12 | ~0.5 s per check | ✅ 429–503 ms |
 | 16 | 23:31:58 | Acknowledge the hand stop | `POST /safety/acknowledge?source=operator` | Latch clear | ✅ 200, latch `clear` |
 | 17 | 23:32:05–23:32:19 | **Full sort with Qwen watching** | GUI Play, then GUI stop | Object sorted, no false stops | ✅ **Object sorted into the bin.** 15 Pi0.5 calls in 13 s; about 26 Qwen checks at 2 Hz and none stopped the arm. Stopped from the GUI, not by a safety stop |
+| 18 | 23:40:59–23:41:07 | Hand while the arm holds a cube | (Qwen, automatic) | Stop, go home | ✅ `UNSAFE_HAND` 1.0, model stopped, arm started home |
+| 19 | 23:41:07.547 | Hand still there while homing | (Qwen, automatic) | Freeze | ✅ second stop 1.0, arm held. Play refused at 23:41:18 until acknowledged at 23:41:29 |
+| 20 | 23:41:35–23:41:38 | Play again; arm carries the cube to the blue bin | (Qwen, automatic) | No stop | ❌ **false stop**: `UNSAFE_OBJECT` 0.704 just before the release. The arm went home holding the cube ([wrist](2026-11-12-safety-api-tests/frames/falsestop-arm-camera.jpg), [overhead](2026-11-12-safety-api-tests/frames/falsestop-topview.jpg)) |
+| 21 | 23:45:47–23:46:27 | New session (`23c170da`), Play, hand in the overhead view | GUI Play | Stop | ❌ **no stop**: the monitor was off in the new session (bug, finding 6). No safety call was made in that session |
+| 22 | after the fix | New session loads the follower's saved monitor settings | unit test `test_a_new_session_watches_with_the_followers_saved_monitor` | Monitor on without a safety call | ✅ fails before the fix, passes after; 112 runtime-session tests pass |
+| 23 | 23:50 | Old vs new scene prompt, offline | `POST /v1/chat/completions` ×210 ([prompt_bench.py](2026-11-12-safety-api-tests/prompt_bench.py)) | Fewer false stops, hands still caught | ✅ see "Scene prompt comparison" |
 
 The event log for the session, oldest first (`GET /safety/events`):
 
@@ -167,6 +178,35 @@ We could not measure the time from the hand entering the view to the stop: the h
 timestamp. The worst case from the design is about one check interval plus one check, ~0.5 + 0.43 ≈
 0.9 s.
 
+## Scene prompt comparison (test 23)
+
+Both prompts were run on the same frames: 100 pairs from the sorting dataset this scene was recorded
+in (60 at random, 40 while the gripper holds a cube), the false-stop frames of test 20, and the
+frames of the 4 real hand stops. A stop means an unsafe answer with confidence ≥ 0.6, as in the
+monitor. Prompts: [old](2026-11-12-safety-api-tests/prompt_old.txt),
+[new](2026-11-12-safety-api-tests/prompt_new.txt); per-frame results in
+[prompt_bench_results.json](2026-11-12-safety-api-tests/prompt_bench_results.json).
+
+| Frames | Pairs | Old prompt: stops | New prompt: stops | Want |
+|---|---|---|---|---|
+| Dataset, random | 60 | 2 | **0** | 0 |
+| Dataset, holding a cube | 40 | 2 | 1 | 0 |
+| Test 20 false stop | 1 | 1 (0.704) | **0** (0.561) | 0 |
+| Real hand stops | 4 | 4 (0.996–1.0) | **4** (0.998–1.0) | 4 |
+| **False stops on normal frames** | **101** | **5 (5 %)** | **1 (1 %)** | |
+| Mean check time | | 437 ms | 461 ms | |
+
+What the new prompt adds: a cube held in the gripper fills the wrist image and is allowed; over a
+bin the wrist camera sees past the mat (desk, wall, tripod, cables, power strip), and those are
+ignored; for objects, trust the overhead camera; a hand counts in either camera. The cost is ~24 ms
+more per check (a longer prompt). The one remaining false stop (pair 20997, 0.914) shows the wrist
+circuit board beside two cubes in the gripper. The test 20 frames now score 0.561, under the 0.6
+threshold but not by much. If it recurs live, `unsafe_consecutive: 2` is the next step (+0.5 s per
+real stop).
+
+The new prompt is in `application/backend/scripts/safety.sh`. It takes effect with
+`./safety.sh monitor-on`.
+
 ## Findings
 
 1. **Bug, fixed: `safety.sh` status summary crashed.** Its inline Python used `\"` inside a bash
@@ -189,10 +229,20 @@ timestamp. The worst case from the design is about one check interval plus one c
    (`images.topview`, `images.arm-camera`). Plain `topview` returns HTTP 500 *"Expected input 'images'
    not found"*.
 
+6. **Bug, fixed: a new session did not monitor.** The monitor reads the follower's saved safety
+   settings, but a session only loaded them on its first safety call (`status`, `stop`, `PUT`, …), not
+   when the environment loaded. In a freshly opened Run model page the monitor stayed off, so a hand
+   did not stop Pi0.5 (test 21). Loading the environment now loads the settings
+   (`runtime_session/session.py`, `load_environment`), covered by the test in row 22.
+7. **Behaviour to know: a stop while holding a cube keeps the cube.** The home pose includes the
+   gripper (captured at 50.06, the closed end of the training range), so the arm carries what it holds
+   home instead of dropping it somewhere unknown. Take the cube out by hand or by teleop before Play.
+   After a stop, Pi0.5 restarts from home, so a cube still in the gripper is a situation it was not
+   trained on.
+
 ## Not tested yet
 
-- Qwen on clean frames from **today's** scene (white mat) by `curl`. The clean frames above are from
-  a July recording; today's scene was only checked by the live monitor (test 15).
+- The new scene prompt live on the arm (test 23 was offline).
 - Objects other than a hand (`UNSAFE_OBJECT`: a cup, a phone, a tool).
 - Fail-safe stop: block the Qwen port or freeze a camera, and expect a stop after 2 s.
 - Stop latency measured against camera timestamps.

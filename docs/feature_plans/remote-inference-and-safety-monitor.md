@@ -2,6 +2,14 @@
 
 Status: draft, 2026-11-12. Branch `feature/remote-inference-safety` (from `main` @ 8f132416).
 
+| | |
+|---|---|
+| **Branch** | [`yogit2020/physical-ai-studio` · `feature/remote-inference-safety`](https://github.com/yogit2020/physical-ai-studio/tree/feature/remote-inference-safety) |
+| **Open a PR** | [compare with `main`](https://github.com/yogit2020/physical-ai-studio/compare/main...feature/remote-inference-safety) (not opened yet) |
+| **Tests done** | [`docs/reports/2026-11-12-safety-api-tests.md`](../reports/2026-11-12-safety-api-tests.md): 23 tests on the live SO-101 and offline. Studio safety API, direct `curl` calls to Pi0.5 and Qwen with timings, real hand stops, one false stop, a full sort, and the scene prompt comparison |
+| **Unit tests** | `application/backend/tests/runtime_session/test_safety.py`, `test_safety_monitor.py` (112 runtime-session tests pass) |
+| **Shell tool** | `application/backend/scripts/safety.sh` (status, stop, ack, home, monitor-on, events, frames) |
+
 ## 1. Goal
 
 Run a robot task with two models on two accelerator cards of one remote machine:
@@ -249,8 +257,12 @@ Loop, at `check_hz` (default 2 Hz; each check is skipped if the previous one is 
    were flagged (bin logos read as people, the tripod and wall behind the desk, the arm's own circuit
    boards and wires). What fixed it: judge only the white mat and ignore everything beyond it; list the
    arm's exposed electronics, the green TRASH bin and blue RECYCLE bin; and say that the wrist camera
-   sees bins, logos and blocks very close and cut off at the edges. The prompt is per session
-   (`prompt`) because it is specific to the cell.
+   sees bins, logos and blocks very close and cut off at the edges. Live testing on 2026-11-12 found
+   one more case: a cube held in the gripper fills the wrist image, and over a bin the wrist camera
+   looks past the mat. Allowing the held cube, ignoring the off-mat view, and trusting the overhead
+   camera for objects cut false stops from 5 to 1 in 101 pairs, with all hands still caught (report
+   test 23). The prompt is per session (`prompt`) because it is specific to the cell. The current
+   one is in `scripts/safety.sh`.
 4. Publish the verdict on the session bus (`evt/safety/verdict`).
 5. Decide (see 4.3) and, when it is a stop, request it from the session.
 
@@ -408,6 +420,135 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 - `SessionState` gains `safety: {state, health}`, so the existing `state` message reflects a latch.
 - Bus commands mirroring the REST calls for the GUI: `set_safety`, `safety_stop`, `safety_acknowledge`.
 
+### 5.3 Proposed UI (phase 4)
+
+*Not built yet.* Today the Run model page shows no safety state. The only sign of a stop is the
+`safety_latched` toast when Play is refused, and everything else needs `safety.sh`. The proposal
+adds safety to the page you already use: **Models → Run model → Inference mode**. Each element is
+listed with the API call or socket message behind it, and all of those already exist (§5.1, §5.2).
+No backend change is needed.
+
+#### Today's page
+
+```
+┌──────────────────────────────────────────────┬──────────────────────────┐
+│  [ topview ]   [ arm-camera ]   [ Follower ] │ Environment · Model      │
+│                                              │ ───────────────────────  │
+│                                              │ Mode        [Inference ▾]│
+│                                              │ Task        [Sort this…] │
+│         camera / robot dock                  │ Execution   [Sync ▾]     │
+│                                              │ Action rate ──●── 30 Hz  │
+│                                              │ Next chunk  ──●── 50 %   │
+│                                              │ [        Play        ]   │
+└──────────────────────────────────────────────┴──────────────────────────┘
+```
+
+#### Change 1: a Safety card above Play (normal running)
+
+```
+                                               │ ┌ Safety ───────────────┐│
+                                               │ │ Monitor  (●) On       ││  ← switch
+                                               │ │ ● Watching · SAFE 0.94││  ← status dot + last verdict
+                                               │ │   433 ms · 2 checks/s ││
+                                               │ │ Home   ✓ captured     ││
+                                               │ │ [Capture][Go home]    ││
+                                               │ │ On stop  [Go home ▾]  ││  ← Go home | Hold
+                                               │ │ Settings…             ││  ← opens change 5
+                                               │ └───────────────────────┘│
+                                               │ [        Play        ]   │
+```
+
+| Element | Shows / does | Behind it |
+|---|---|---|
+| Monitor switch | Turns Qwen on or off | `PUT /safety {"monitor": {"enabled": …}}` (`set_safety` on the bus) |
+| Status dot | 🟢 watching (`guarding`), ⚪ on but idle, 🟡 `degraded`, 🔴 `down`, — off | `SessionState.safety.monitor.health`, `.guarding` |
+| Last verdict | Answer, confidence, latency. Updates up to 2× per second | `safety` socket messages, `monitor.last_verdict` |
+| Home | ✓ captured / ⚠ not captured (then a stop holds instead of going home) | `config.home_pose` |
+| Capture home / Go home | Saves the pose / moves home. Go home is disabled while Play runs | `POST /safety/home/capture`, `POST /safety/home/go` |
+| On stop | Go home (default) or Hold | `PUT /safety {"on_stop": …}` |
+
+#### Change 2: a red stop banner replaces Play (latched)
+
+```
+                                               │ ┌ ⛔ Safety stop ───────┐│
+                                               │ │ Hand or person seen   ││  ← hazard
+                                               │ │ by Qwen · 99.7 %      ││  ← source + confidence
+                                               │ │ 23:08:47 · arm frozen ││  ← time + motion: home | frozen
+                                               │ │ ┌──────┐ ┌──────┐     ││
+                                               │ │ │ img1 │ │ img2 │     ││  ← frames it judged (click: full size)
+                                               │ │ └──────┘ └──────┘     ││
+                                               │ │ Clear the work area,  ││
+                                               │ │ then acknowledge.     ││
+                                               │ │ [Go home][Acknowledge]││
+                                               │ └───────────────────────┘│
+                                               │ [  Play (disabled)  ]    │
+```
+
+- It appears the moment a stop lands (`safety` message with `kind: stop`), from Qwen, a script,
+  or another client. A toast says the same thing in case the sidebar is scrolled.
+- **Moving home…** with a progress bar while `state = homing`. It switches to **arm frozen** if a
+  second stop interrupts the move. That is the case from the 2026-11-12 test, where the user
+  could not tell why the arm "just stopped".
+- **Go home** sends the arm home after a freeze (`POST /safety/home/go`).
+- **Acknowledge** (`POST /safety/acknowledge?source=gui`) clears the banner and enables Play again.
+  It does **not** press Play.
+- Frames come from `GET /safety/events/{id}/frames/{camera}`.
+
+#### Change 3: camera panels show what Qwen is judging
+
+```
+┌ topview ──────────────── ● SAFE ┐      ┌ topview ──────────── ⛔ HAND ┐
+│                                 │      │ (red border while latched)   │
+│                                 │      │                              │
+└─────────────────────────────────┘      └──────────────────────────────┘
+```
+
+A small badge in the title of each camera the monitor watches (`config.monitor.cameras`): green
+SAFE, red with the hazard while latched, grey when the monitor is off. Cameras the monitor does not
+watch get no badge, so it is clear which views are covered.
+
+#### Change 4: a Stop now button while the model runs
+
+While Play runs, the Stop button gets a red **Safety stop** next to it. It makes the same stop
+Qwen makes (`POST /safety/stop {"source": "gui", "hold": false}`): stop, go home, latch. The plain
+**Stop** button keeps today's behaviour (stop, no latch, no homing). Neither replaces the power
+switch.
+
+#### Change 5: a Safety settings dialog and a log
+
+```
+┌ Safety settings ──────────────────────────────┐   ┌ Safety log ───────────────────────────┐
+│ Monitor endpoint  [http://172.18.0.1:18766/v1]│   │ 23:31:58  ✓ Acknowledged · operator   │
+│ Model             [qwen-safety]               │   │ 23:08:48  ⛔ Hand · Qwen · 100 % froze│
+│ Cameras           [✓ topview] [✓ arm-camera]  │   │ 23:08:47  ⛔ Hand · Qwen · 99.7 % home│
+│ Checks per second ──●── 2                     │   │ 22:58:21  ⛔ "test" · safety.sh · home│
+│ Stop at confidence ──●── 0.60                 │   │ 22:50:04  ⌂ Home captured             │
+│ Unsafe checks in a row  [1]                   │   │                    [Show frames ▸]    │
+│ Fail-safe after   [2.0] s                     │   └───────────────────────────────────────┘
+│ Scene prompt      [ … multi-line … ]          │
+│                         [Cancel] [Save]       │
+└───────────────────────────────────────────────┘
+```
+
+Settings write `PUT /safety`, and fields left unchanged keep their values. The log reads
+`GET /safety/events`. This is where a false stop is reviewed and the threshold or prompt is tuned
+(see the 0.559 `UNSAFE_OBJECT` in the 2026-11-12 report).
+
+#### Where the code goes
+
+| File (`application/ui/src/features/runtime-session/…`) | Change |
+|---|---|
+| `workspace/safety-card.tsx` (new) | Change 1: switch, status, home, on-stop |
+| `workspace/safety-banner.tsx` (new) | Change 2: banner, frames, Go home, Acknowledge |
+| `workspace/inference-mode.tsx` | Renders the card or the banner above Play. Play is disabled while latched. Adds the Safety stop button (change 4) |
+| `cells/camera-cell.tsx` | Change 3: verdict badge and red border |
+| `workspace/safety-settings-dialog.tsx`, `safety-log.tsx` (new) | Change 5 |
+| `runtime-session-provider.tsx` | Keeps the latest `safety` message and `state.safety` in context. A toast on every stop |
+
+Tests: render the card and the banner for each latch state (`clear`, `homing`, `latched`) and
+health (`ok`, `degraded`, `down`), check that Play is disabled while latched, and check that
+Acknowledge sends the right command without starting control.
+
 ## 6. Configuration
 
 - Remote policy device: `/app/storage/remote_inference.json`
@@ -430,6 +571,7 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 | Tunnel drops during policy inference | `RemotePredictor` raises, model control ends, session holds (existing behaviour) |
 | Remote policy server has a different model | Model load fails with a fingerprint mismatch |
 | False stop | Operator acknowledges; event + frames saved for tuning `min_confidence`, `unsafe_consecutive`, prompt |
+| New session opened | Loads the follower's saved monitor settings when the environment loads (until 2026-11-12 it waited for the first safety call and did not monitor) |
 | Session stopped / environment unloaded | `SafetyWorker` stops with it; latch is cleared with the session |
 
 ## 8. Code changes
@@ -445,7 +587,7 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 | `runtime_session/session.py` | owns latch + worker; `set_control` checks the latch; `safety_*` bus commands |
 | `schemas/runtime_session.py` | `SafetyConfig`, `SafetyStatus`, `SafetyEvent`, `SessionState.safety`, messages |
 | `api/runtime_sessions.py` | the REST routes of 5.1 |
-| UI | safety toggle + status dot in Run model; red banner with reason, frame, **Acknowledge** |
+| UI | Safety card, stop banner, camera badges, Safety stop button, settings + log; see §5.3 |
 
 ## 9. Test plan
 
@@ -464,7 +606,7 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 1. Port remote policy inference to `main`'s `ModelWorker.open_model()`. *(done, 4e093cc7)*
 2. Safety latch + REST/bus stop/acknowledge/status — testable with `curl`, no VLM needed. *(done, 6ff0bc88)*
 3. `SafetyMonitor` + config + events. *(done)*
-4. UI.
+4. UI. *(proposed in §5.3)*
 5. Live validation on the SO-101.
 
 ## 11. Open questions
