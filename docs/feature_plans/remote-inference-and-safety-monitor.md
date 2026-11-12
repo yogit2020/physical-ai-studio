@@ -187,6 +187,13 @@ The **latch** then makes the stop stick:
 
 ## 5. API
 
+**Implemented in phase 2** (6ff0bc88): the latch, stop/acknowledge, home capture/go, config and events
+below, with latch states `clear | latched | homing` (`SessionState.safety`). The monitor fields of
+`SafetyConfig` and `SafetyStatus` (`enabled`, `endpoint`, `cameras`, `check_hz`, `health`,
+`last_verdict`, …) and the per-stop frames come with phase 3. `acknowledge` takes `?source=`.
+Bus commands on the session socket: `safety_stop`, `safety_acknowledge`, `set_safety`,
+`capture_home`, `go_home`; events arrive as `{"type": "safety", "data": SafetyEvent}`.
+
 All new routes sit under the existing runtime-session router (`/api/runtime/sessions`), which is
 process-wide, not project-scoped — the same scope as the existing `POST /{session_id}/stop`.
 
@@ -328,9 +335,9 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 
 ## 10. Phases
 
-0. Serve Qwen3.6-27B INT4 on GPU 0, benchmark; choose the monitor model. *(in progress)*
-1. Port remote policy inference to `main`'s `ModelWorker.open_model()`.
-2. Safety latch + REST/bus stop/acknowledge/status — testable with `curl`, no VLM needed.
+0. Serve Qwen3.6-27B INT4 on GPU 0, benchmark; choose the monitor model. *(done; hazard frames still to test)*
+1. Port remote policy inference to `main`'s `ModelWorker.open_model()`. *(done, 4e093cc7)*
+2. Safety latch + REST/bus stop/acknowledge/status — testable with `curl`, no VLM needed. *(done, 6ff0bc88)*
 3. `SafetyWorker` + config + events.
 4. UI.
 5. Live validation on the SO-101.
