@@ -14,6 +14,8 @@ from loguru import logger
 from internal_datasets.lerobot.video_encoding_settings import available_video_encoding_presets
 from schemas.hardware import DeviceInfo, DeviceType, InferenceBackend, InferenceDeviceInfo, TrainingDevices
 from schemas.video_recording import VideoRecordingPreset, VideoRecordingPresets
+from workers.remote_predictor import REMOTE_DEVICE
+from workers.remote_predictor import load_config as load_remote_config
 
 
 class SystemService:
@@ -29,7 +31,25 @@ class SystemService:
         """
         devices = cls._get_torch_inference_devices()
         devices.extend(cls._get_openvino_inference_devices())
+        devices.extend(cls._get_remote_inference_devices())
         return devices
+
+    @staticmethod
+    def _get_remote_inference_devices() -> list[InferenceDeviceInfo]:
+        """The remote policy server's accelerator, when remote inference is configured."""
+        config = load_remote_config()
+        if config is None:
+            return []
+        return [
+            InferenceDeviceInfo(
+                backend=InferenceBackend(config.get("backend", InferenceBackend.OPENVINO)),
+                device=REMOTE_DEVICE,
+                type=DeviceType.XPU,
+                name=config.get("name", f"Remote ({config['url']})"),
+                memory=config.get("memory"),
+                index=None,
+            )
+        ]
 
     @staticmethod
     def get_video_recording_presets() -> VideoRecordingPresets:

@@ -23,6 +23,8 @@ from runtime_session.bus import Bus
 from runtime_session.store import FeatureSpec, Store
 from schemas.runtime_session import CommandDone
 from workers.base import ProcessWorker
+from workers.remote_predictor import REMOTE_DEVICE, RemotePredictor
+from workers.remote_predictor import load_config as load_remote_config
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -109,9 +111,17 @@ class ModelWorker(ProcessWorker[Inference]):
 
     def open_model(self) -> Predictor:
         """Runs in the child. Tests replace this to infer without a real export."""
+        if self.device == REMOTE_DEVICE:
+            return self._open_remote_model()
         from physicalai.inference import InferenceModel
 
         return InferenceModel(self.export_dir, backend=self.backend, device=self.device)
+
+    def _open_remote_model(self) -> Predictor:
+        config = load_remote_config()
+        if config is None:
+            raise RuntimeError("The remote inference device was chosen, but remote inference is not configured")
+        return RemotePredictor(self.export_dir, config["url"], timing_log=config.get("timing_log"))
 
     @asynccontextmanager
     async def lifecycle(self) -> AsyncIterator[Inference]:
