@@ -151,14 +151,45 @@ HazardKind = Literal["none", "hand_or_person", "unknown_object", "other"]
 StoppableControl = Literal["model", "teleop"]
 
 
+class MonitorConfig(BaseModel):
+    """The vision-language model that watches the cameras and stops the control when it sees a hazard.
+
+    It speaks the OpenAI chat API (vLLM, say) and answers one word: ``SAFE``, ``UNSAFE_HAND`` or
+    ``UNSAFE_OBJECT``. See docs/feature_plans/remote-inference-and-safety-monitor.md.
+    """
+
+    enabled: bool = False
+    endpoint: str | None = None
+    """The API base, such as ``http://172.18.0.1:18766/v1``."""
+    model: str = "qwen-safety"
+    cameras: list[str] = Field(default_factory=list)
+    """Store camera keys to show the model, in order; empty shows every camera."""
+    check_hz: float = Field(
+        default=2.0, gt=0, le=10, description="Checks per second; a check still running is not doubled"
+    )
+    image_max_side: int = Field(default=448, ge=64, le=1920)
+    timeout_s: float = Field(default=3.0, gt=0, le=30)
+    min_confidence: float = Field(default=0.6, ge=0, le=1)
+    """An unsafe answer below this probability does not count."""
+    unsafe_consecutive: int = Field(default=1, ge=1, le=10)
+    fail_safe_after_s: float = Field(default=2.0, gt=0, le=60)
+    """Stop when no check has succeeded for this long while a control the monitor guards drives."""
+    max_frame_age_s: float = Field(default=1.0, gt=0, le=10)
+    """A frame older than this means a frozen camera: a failed check, not a safe one."""
+    prompt: str | None = None
+    """The scene description; ``None`` uses a generic one. The one-word answer instruction is added."""
+
+
 class SafetyConfig(BaseModel):
     """What the session does when something reports a hazard. Kept per follower robot."""
+
+    monitor: MonitorConfig = Field(default_factory=MonitorConfig)
 
     on_stop: Literal["home", "hold"] = "home"
     """``home`` moves the follower to ``home_pose`` after stopping it; ``hold`` leaves it where it stopped."""
     home_pose: list[float] | None = None
     """In the follower's joint order and units; ``None`` until captured, and the follower then holds instead."""
-    home_duration_s: float = Field(4.0, gt=0, le=30, description="The move home takes at least this long")
+    home_duration_s: float = Field(default=4.0, gt=0, le=30, description="The move home takes at least this long")
     max_joint_speed: float = Field(
         45.0, gt=0, description="Joint units per second; a longer move home is slowed down to stay under it"
     )
@@ -176,7 +207,7 @@ class SafetyStopRequest(BaseModel):
     """Freeze the follower where it is instead of moving it home; also interrupts a move home."""
 
 
-SafetyEventKind = Literal["stop", "acknowledge", "home_captured", "home", "config"]
+SafetyEventKind = Literal["stop", "acknowledge", "home_captured", "home", "config", "verdict", "monitor_fault"]
 
 
 class SafetyEvent(BaseModel):
@@ -191,6 +222,23 @@ class SafetyEvent(BaseModel):
     """The control a stop ended, if one was running."""
     motion: Literal["home", "hold", "none"] | None = None
     """What the follower was told to do: move home, hold where it is, or nothing (another control drives it)."""
+    answer: str | None = None
+    """The monitor's one-word answer, for a verdict."""
+    latency_ms: float | None = None
+    frames: list[str] = Field(default_factory=list)
+    """Cameras whose frames were saved with a stop; fetch them from ``/safety/events/{id}/frames/{camera}``."""
+
+
+MonitorHealth = Literal["off", "ok", "degraded", "down"]
+
+
+class MonitorState(BaseModel):
+    health: MonitorHealth = "off"
+    """``degraded``: checks are failing but not for ``fail_safe_after_s`` yet; ``down``: they have been."""
+    guarding: bool = False
+    """Whether a control the monitor would stop is driving now."""
+    last_verdict: SafetyEvent | None = None
+    error: str | None = None
 
 
 SafetyLatchState = Literal["clear", "latched", "homing"]
@@ -201,6 +249,7 @@ class SessionSafety(BaseModel):
     """``latched`` blocks starting a stopped control until a person acknowledges; ``homing`` is latched and moving."""
     latched_by: SafetyEvent | None = None
     home_pose_set: bool = False
+    monitor: MonitorState = MonitorState()
 
 
 class SafetyStatus(SessionSafety):

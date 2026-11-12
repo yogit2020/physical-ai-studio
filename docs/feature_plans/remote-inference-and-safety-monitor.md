@@ -99,11 +99,14 @@ and an `open_model()` hook. A remote device plugs in there:
 The device appears in `GET /api/system/devices/inference` as `{backend: "openvino", device: "REMOTE",
 name: "<configured name>"}` only when a remote inference config is present.
 
-### 4.2 Safety monitor (`SafetyWorker`)
+### 4.2 Safety monitor (`SafetyMonitor`)
 
-A `ProcessWorker` owned by the session, started when monitoring is enabled and the session has an
-environment loaded. It attaches to the session's store like `ModelWorker` does, so reading frames
-costs nothing for the control loop.
+*As built (phase 3):* an asyncio task the session starts when it opens
+(`runtime_session/safety_monitor.py`), not a separate process: a check is network I/O plus two
+small JPEG encodes, and the encodes run on a thread. It reads the newest frames from the session's
+store and is idle while `monitor.enabled` is false, no endpoint is set, or no environment is loaded.
+Settings live in `SafetyConfig.monitor` (`MonitorConfig`), kept per follower with the home pose; a
+`PUT /safety` that leaves a field out keeps its current value.
 
 Loop, at `check_hz` (default 2 Hz; each check is skipped if the previous one is still in flight):
 
@@ -135,8 +138,14 @@ Loop, at `check_hz` (default 2 Hz; each check is skipped if the previous one is 
 4. Publish the verdict on the session bus (`evt/safety/verdict`).
 5. Decide (see 4.3) and, when it is a stop, request it from the session.
 
-Monitoring runs whenever enabled, not only while the model drives: a hazard during teleop or idle
-is reported, but only a running **model** control is stopped (configurable, `stop_controls`).
+Monitoring runs whenever enabled, but the monitor only **acts while it guards**: a control in
+`stop_controls` (default: model) drives, or the follower is moving home. Otherwise verdicts are only
+reported — a hand setting up the bench does not latch an idle session, and an outage while idle
+does not count towards the fail-safe. One fail-safe stop is made per outage. Frames a stop was
+judged on are saved under `<storage>/safety/frames/<event_id>/` and served at
+`GET /safety/events/{event_id}/frames/{camera}`. Verdicts go to the socket as `safety` messages
+(SAFE ones at most twice a second); `SessionState.safety.monitor` carries `health`
+(`off | ok | degraded | down`), `guarding`, `last_verdict` and `error`.
 
 ### 4.3 Stop decision and the safety latch
 
@@ -338,7 +347,7 @@ On the session's bus, so the session websocket (`/api/runtime/ws`) carries them 
 0. Serve Qwen3.6-27B INT4 on GPU 0, benchmark; choose the monitor model. *(done; hazard frames still to test)*
 1. Port remote policy inference to `main`'s `ModelWorker.open_model()`. *(done, 4e093cc7)*
 2. Safety latch + REST/bus stop/acknowledge/status — testable with `curl`, no VLM needed. *(done, 6ff0bc88)*
-3. `SafetyWorker` + config + events.
+3. `SafetyMonitor` + config + events. *(done)*
 4. UI.
 5. Live validation on the SO-101.
 

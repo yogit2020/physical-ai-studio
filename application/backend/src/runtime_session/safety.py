@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from pathlib import Path
     from uuid import UUID
 
-    from schemas.runtime_session import ControlConfig, SafetyEventKind
+    from schemas.runtime_session import ControlConfig, MonitorState, SafetyEventKind
 
 _EVENTS_KEPT = 500
 
@@ -58,7 +58,9 @@ class SafetyLatch:
             self.config = SafetyConfig()
 
     def configure(self, config: SafetyConfig, *, source: str) -> SafetyEvent:
-        self.config = config
+        """Take ``config``; fields it leaves unset keep their current values, so a home pose survives."""
+        unset = set(SafetyConfig.model_fields) - config.model_fields_set
+        self.config = config.model_copy(update={name: getattr(self.config, name) for name in unset})
         self._save()
         return self.record("config", source=source)
 
@@ -130,6 +132,11 @@ class SafetyLatch:
 
     # Reporting.
 
+    def keep(self, event: SafetyEvent) -> None:
+        """Keep an event made elsewhere (a monitor fault) with the session's others."""
+        self._events.append(event)
+        self._counters[event.kind] += 1
+
     def record(self, kind: SafetyEventKind, *, source: str, **fields: object) -> SafetyEvent:
         event = SafetyEvent(
             id=uuid4().hex,
@@ -147,11 +154,16 @@ class SafetyLatch:
         events = [event for event in reversed(self._events) if not stops_only or event.kind == "stop"]
         return events[:limit]
 
-    def summary(self) -> SessionSafety:
+    def summary(self, monitor: MonitorState) -> SessionSafety:
         state = "homing" if self.homing else "latched" if self.latched else "clear"
-        return SessionSafety(state=state, latched_by=self.latched_by, home_pose_set=self.config.home_pose is not None)
+        return SessionSafety(
+            state=state, latched_by=self.latched_by, home_pose_set=self.config.home_pose is not None, monitor=monitor
+        )
 
-    def status(self, session_id: str) -> SafetyStatus:
+    def status(self, session_id: str, monitor: MonitorState) -> SafetyStatus:
         return SafetyStatus(
-            **self.summary().model_dump(), session_id=session_id, config=self.config, counters=dict(self._counters)
+            **self.summary(monitor).model_dump(),
+            session_id=session_id,
+            config=self.config,
+            counters=dict(self._counters),
         )

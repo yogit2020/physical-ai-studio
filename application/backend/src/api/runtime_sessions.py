@@ -12,7 +12,7 @@ from typing import Annotated
 import anyio
 from fastapi import APIRouter, Query, WebSocket, status
 from fastapi.exceptions import HTTPException
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.websockets import WebSocketDisconnect
 
 from api.dependencies import RuntimeSessionRegistryDep
@@ -116,6 +116,22 @@ async def safety_events(
 ) -> list[SafetyEvent]:
     """The session's safety events, newest first."""
     return _session(registry, session_id).safety_events(limit=limit, stops_only=stops_only)
+
+
+@router.get(
+    "/{session_id}/safety/events/{event_id}/frames/{camera}",
+    tags=["Safety"],
+    response_class=FileResponse,
+    responses={200: {"content": {"image/jpeg": {}}}},
+)
+async def safety_event_frame(
+    session_id: str, event_id: str, camera: str, registry: RuntimeSessionRegistryDep
+) -> FileResponse:
+    """A JPEG the safety monitor judged, saved with the stop it made."""
+    path = _session(registry, session_id).safety_frame(event_id, camera)
+    if path is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such frame")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @router.post("/{session_id}/safety/home/capture", tags=["Safety"])
