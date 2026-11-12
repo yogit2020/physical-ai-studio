@@ -1,0 +1,283 @@
+# Remote inference and a VLM safety monitor for runtime sessions
+
+Status: draft, 2026-11-12. Branch `feature/remote-inference-safety` (from `main` @ 8f132416).
+
+## 1. Goal
+
+Run a robot task with two models on two accelerator cards of one remote machine:
+
+- **Pi0.5** drives the follower (the policy, card 1).
+- **Qwen** (vision-language model, card 0) watches the cameras while the policy runs. If it sees a
+  hazard — a hand or person in the workspace, a fallen object, an obstruction — it **stops the policy
+  and holds the arm** until a person acknowledges.
+
+The robot and cameras stay attached to the Studio machine. Both models run on the remote machine
+(an Arc Pro B70 DevCloud host with two 32 GB cards) and are reached over an SSH tunnel.
+
+Anything else — another model, a button, a script — must be able to trigger the same stop through
+the API, so the stop path is independent of Qwen.
+
+### Non-goals
+
+- This is **not a certified safety function**. A VLM can miss hazards and reacts in hundreds of
+  milliseconds, not microseconds. The physical power cut-off remains the emergency stop.
+- No change to how policies are trained or exported.
+
+## 2. Hardware layout
+
+| Card | Model | Serving | Memory | Measured / expected |
+|---|---|---|---|---|
+| B70 GPU 1 (PCI 54:00.0) | Pi0.5 "210base 65ft", OpenVINO export | `remote_policy_server.py` | ~6.4 GB | 66–72 ms inference, **102 ms** end to end from Studio (live run, 2026-11-06) |
+| B70 GPU 0 (PCI 18:00.0) | `Intel/Qwen3.6-27B-int4-AutoRound` (vision kept bf16) | vLLM XPU, OpenAI API | 17.7 GiB weights, ≤75% of card | to be measured; estimate 1–1.5 s per check |
+
+Fallback monitor models if Qwen3.6-27B INT4 is too slow: `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.5-4B`.
+Each card carries ~6.2 GB of baseline driver usage, so ~25.7 GiB is usable per card; FP8 27B (28.7 GiB)
+does not fit.
+
+## 3. Architecture
+
+```
+ Studio machine (robot + cameras)                                 B70 (remote)
+ ┌──────────────────────────────────────────────────────┐         ┌──────────────────────────────┐
+ │ RuntimeSession (API process)                          │         │                              │
+ │  ├─ Store (shared memory): state, action, camera frames│         │                              │
+ │  ├─ RobotWorker ── follows `action`                   │         │                              │
+ │  ├─ CameraWorkers ── write frames                     │         │                              │
+ │  ├─ ModelControl (thread) ── PolicySource ──┐         │         │                              │
+ │  │                                          ▼         │  tunnel │ GPU 1: remote_policy_server  │
+ │  ├─ ModelWorker (process) ── RemotePredictor ─────────┼────────►│  OpenVINO Pi0.5              │
+ │  │                                                    │  :18765 │                              │
+ │  ├─ SafetyWorker (process, NEW) ── reads frames ──────┼────────►│ GPU 0: vLLM Qwen-VL          │
+ │  │     verdicts on the bus                            │  :18766 │                              │
+ │  └─ SafetyLatch (NEW) ── set_control(None) + latch    │         └──────────────────────────────┘
+ │                                                       │
+ │ REST + WS: /api/runtime/sessions/{id}/safety/...      │◄── GUI, external monitors, scripts
+ └──────────────────────────────────────────────────────┘
+```
+
+Pi0.5 and Qwen run concurrently and independently: the policy never waits for a safety check, and a
+slow or failed check never delays an action. The only coupling is the stop.
+
+## 4. Components
+
+### 4.1 Remote policy inference (`RemotePredictor`)
+
+`workers/model_worker.py` already defines a `Predictor` protocol (`predict_action_chunk`, `reset`)
+and an `open_model()` hook. A remote device plugs in there:
+
+- `ModelWorker.open_model()` returns `RemotePredictor(export_dir, url)` when `device == "REMOTE"`,
+  otherwise the existing `InferenceModel`.
+- `RemotePredictor.predict_action_chunk(observation)` takes the worker's flat observation
+  (`state`, `images.<camera>` as `H×W×3 uint8`, optional `task`), JPEG-encodes each frame (q95,
+  ~45 KB/frame), POSTs to `/predict`, returns the `(chunk, action_dim)` array.
+- On load it calls `/info` and compares a **weights fingerprint** (size + SHA-256 of the first and
+  last 16 MiB of the weights file) with the local export. A mismatch fails the load: the robot is
+  never driven by a different model than the one selected.
+- HTTP client ignores proxy environment variables (`trust_env=False`) so tunnel traffic is not sent
+  to a corporate proxy.
+- Per-call timing (encode, request, remote inference, network, total, payload) is appended to a CSV
+  when configured — the instrument used for the 2026-11-06 live numbers.
+
+The device appears in `GET /api/system/devices/inference` as `{backend: "openvino", device: "REMOTE",
+name: "<configured name>"}` only when a remote inference config is present.
+
+### 4.2 Safety monitor (`SafetyWorker`)
+
+A `ProcessWorker` owned by the session, started when monitoring is enabled and the session has an
+environment loaded. It attaches to the session's store like `ModelWorker` does, so reading frames
+costs nothing for the control loop.
+
+Loop, at `check_hz` (default 2 Hz; each check is skipped if the previous one is still in flight):
+
+1. Read the newest frame of each configured camera. A frame older than `max_frame_age_s` is a fault
+   (frozen camera), not a "safe" verdict.
+2. Downscale to `image_max_side` (default 448 px) and JPEG-encode — fewer image tokens, faster prefill.
+3. POST `/v1/chat/completions` to the monitor endpoint with the prompt, the images, `temperature: 0`,
+   thinking disabled (`chat_template_kwargs: {enable_thinking: false}`), and a JSON-schema
+   `response_format` so the reply is always parseable:
+
+   ```json
+   {"safe": false, "hazard": "hand_or_person", "confidence": 0.93, "reason": "hand above the red bin"}
+   ```
+   `hazard` ∈ `none | hand_or_person | fallen_object | obstruction | other`.
+4. Publish the verdict on the session bus (`evt/safety/verdict`).
+5. Decide (see 4.3) and, when it is a stop, request it from the session.
+
+Monitoring runs whenever enabled, not only while the model drives: a hazard during teleop or idle
+is reported, but only a running **model** control is stopped (configurable, `stop_controls`).
+
+### 4.3 Stop decision and the safety latch
+
+Stop when any of:
+
+- `unsafe_consecutive` (default 1) verdicts in a row have `safe: false` and
+  `confidence ≥ min_confidence` (default 0.6);
+- the monitor is **unhealthy** for longer than `fail_safe_after_s` (default 2 s): endpoint unreachable,
+  timeouts, unparseable replies, or stale frames. Fail closed: an unwatched robot stops.
+
+The stop is the session's existing hold: `set_control(None)` joins the control and writes the
+follower's current state to `action`, so the arm **holds where it is** with torque on. The session
+does **not** `stop()` (that releases devices and parks the arm).
+
+The **latch** then makes the stop stick:
+
+```
+           enable                     unsafe / fail-safe / POST safety/stop
+ DISABLED ───────► MONITORING ───────────────────────────────────────────► LATCHED
+     ▲                 │  ▲                                                   │
+     └──── disable ────┘  └────────── POST safety/acknowledge (human) ────────┘
+```
+
+- While `LATCHED`, `set_control` with a model config is rejected with a `safety_latched` error;
+  `set_control(None)` and teleop stay allowed so an operator can move the arm clear.
+- Acknowledging clears the latch but **does not resume** — the user presses Play again.
+- The latch lives on the `RuntimeSession`, so it covers every client (GUI, scripts) and every stop
+  source (monitor, REST, future sources).
+- Stop latency budget: check interval + check duration + one control tick. At 2 Hz and ~1 s checks,
+  ~1.5 s worst case; at ~0.3 s checks (smaller model), ~0.8 s.
+
+## 5. API
+
+All new routes sit under the existing runtime-session router (`/api/runtime/sessions`), which is
+process-wide, not project-scoped — the same scope as the existing `POST /{session_id}/stop`.
+
+### 5.1 REST
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/runtime/sessions/{session_id}/safety` | Safety status: state, config, monitor health, last verdict, counters |
+| `PUT` | `/api/runtime/sessions/{session_id}/safety` | Enable/disable monitoring and set its config |
+| `POST` | `/api/runtime/sessions/{session_id}/safety/stop` | Stop the running model control and latch. For any external source |
+| `POST` | `/api/runtime/sessions/{session_id}/safety/acknowledge` | A person clears the latch; nothing resumes |
+| `GET` | `/api/runtime/sessions/{session_id}/safety/events` | Recent verdicts and stops, newest first (`?limit=`, `?stops_only=`) |
+| `GET` | `/api/runtime/sessions/{session_id}/safety/events/{event_id}/frames/{camera}` | JPEG that triggered a stop |
+| `GET` | `/api/runtime/sessions/{session_id}/cameras/{camera}/latest.jpg` | Newest frame, for external monitors that bring their own model |
+| `GET` | `/api/system/devices/inference` | (existing) also lists the remote policy device when configured |
+
+`POST .../safety/stop` body:
+
+```json
+{ "reason": "light curtain tripped", "source": "plc-gateway", "hazard": "other" }
+```
+Response `200` with the `SafetyStatus` below. Idempotent: stopping while latched returns the current
+status and records the extra event. `404` unknown session; `409` no environment loaded.
+
+`PUT .../safety` body (`SafetyConfig`):
+
+```json
+{
+  "enabled": true,
+  "endpoint": "http://172.18.0.1:18766/v1",
+  "model": "qwen-safety",
+  "cameras": ["topview", "arm-camera"],
+  "check_hz": 2.0,
+  "image_max_side": 448,
+  "timeout_s": 3.0,
+  "min_confidence": 0.6,
+  "unsafe_consecutive": 1,
+  "fail_safe_after_s": 2.0,
+  "max_frame_age_s": 1.0,
+  "stop_controls": ["model"],
+  "prompt": null
+}
+```
+`prompt: null` uses the built-in prompt. `400` for unknown cameras; the endpoint is probed and an
+unreachable endpoint is reported in `health`, not rejected (it may come up later).
+
+`SafetyStatus`:
+
+```json
+{
+  "session_id": "…",
+  "state": "monitoring",            // disabled | monitoring | latched
+  "health": "ok",                   // ok | degraded | down
+  "config": { … },
+  "last_verdict": { "at": "2026-11-12T20:15:03.120Z", "safe": true, "hazard": "none",
+                    "confidence": 0.97, "reason": "…", "latency_ms": 980 },
+  "latched_by": null,               // event id of the stop that latched
+  "counters": { "checks": 1840, "unsafe": 3, "stops": 1, "errors": 0 }
+}
+```
+
+`SafetyEvent`:
+
+```json
+{ "id": "…", "at": "…", "kind": "verdict | stop | acknowledge | health",
+  "source": "monitor | api:<source> | gui", "safe": false, "hazard": "hand_or_person",
+  "confidence": 0.93, "reason": "…", "latency_ms": 1012, "frames": ["topview", "arm-camera"] }
+```
+Events are kept in a ring buffer per session (default 500) and stops with their frames are also
+written under `/app/storage/safety/<session_id>/` for later review and prompt tuning.
+
+### 5.2 Session bus and websocket
+
+On the session's bus, so the session websocket (`/api/runtime/ws`) carries them to the GUI:
+
+- `evt/safety/verdict` → `{type: "safety_verdict", data: SafetyEvent}` — throttled to ≤2/s on the socket.
+- `evt/safety/stop` → `{type: "safety_stop", data: SafetyEvent}` — always sent.
+- `SessionState` gains `safety: {state, health}`, so the existing `state` message reflects a latch.
+- Bus commands mirroring the REST calls for the GUI: `set_safety`, `safety_stop`, `safety_acknowledge`.
+
+## 6. Configuration
+
+- Remote policy device: `/app/storage/remote_inference.json`
+  `{url, name, memory, timing_log}` — file-based so it survives container restarts.
+- Monitor defaults: the same file's `safety` section, overridable per session via `PUT .../safety`.
+- B70 side: `~/yogini/remote-inference/start.sh` (Pi0.5, GPU 1), `~/yogini/qwen-safety/start_qwen.sh`
+  (Qwen, GPU 0). Both bind to `127.0.0.1` on the B70; the Studio host reaches them with
+  `ssh -L 172.18.0.1:18765:127.0.0.1:18765 -L 172.18.0.1:18766:127.0.0.1:18766 b70`
+  (`172.18.0.1` is the Studio container's gateway).
+
+## 7. Failure modes
+
+| Failure | Behaviour |
+|---|---|
+| Qwen says unsafe | Hold + latch within one control tick of the verdict |
+| Qwen endpoint down / timeouts / bad JSON for > `fail_safe_after_s` | `health: down`, hold + latch (fail closed) |
+| Camera frozen (frame older than `max_frame_age_s`) | Treated as monitor unhealthy |
+| Tunnel drops during policy inference | `RemotePredictor` raises, model control ends, session holds (existing behaviour) |
+| Remote policy server has a different model | Model load fails with a fingerprint mismatch |
+| False stop | Operator acknowledges; event + frames saved for tuning `min_confidence`, `unsafe_consecutive`, prompt |
+| Session stopped / environment unloaded | `SafetyWorker` stops with it; latch is cleared with the session |
+
+## 8. Code changes
+
+| Area | Change |
+|---|---|
+| `models/remote_inference.py` (new) | `RemotePredictor`, fingerprint, config loader, timing log |
+| `scripts/remote_policy_server.py` (new) | HTTP server for one export (`/info`, `/predict`) |
+| `workers/model_worker.py` | `open_model()` returns `RemotePredictor` for `device == "REMOTE"` |
+| `services/system_service.py` | lists the remote device when configured |
+| `runtime_session/safety.py` (new) | `SafetyConfig`, `SafetyLatch`, decision logic |
+| `workers/safety_worker.py` (new) | `SafetyWorker` process: store frames → VLM → verdicts on the bus |
+| `runtime_session/session.py` | owns latch + worker; `set_control` checks the latch; `safety_*` bus commands |
+| `schemas/runtime_session.py` | `SafetyConfig`, `SafetyStatus`, `SafetyEvent`, `SessionState.safety`, messages |
+| `api/runtime_sessions.py` | the REST routes of 5.1 |
+| UI | safety toggle + status dot in Run model; red banner with reason, frame, **Acknowledge** |
+
+## 9. Test plan
+
+1. **Unit**: decision logic (thresholds, consecutive, fail-safe timer), latch transitions, `set_control`
+   rejection while latched, `RemotePredictor` fingerprint mismatch — with fake predictors / fake VLM
+   endpoint, following the `open_model()` test hook pattern.
+2. **API**: each route with a fake session; idempotent stop; acknowledge without latch.
+3. **Bench (B70)**: `reports/b70-bench/bench_qwen_safety.py` — per-check latency, false stops on 30
+   dataset frames, missed hazards on staged hazard photos, Pi0.5 latency with Qwen running concurrently.
+4. **Live**: stop latency from hazard onset (hand enters the overhead view) to the follower holding,
+   measured from the event log and camera timestamps; false-stop rate over full sorting episodes.
+
+## 10. Phases
+
+0. Serve Qwen3.6-27B INT4 on GPU 0, benchmark; choose the monitor model. *(in progress)*
+1. Port remote policy inference to `main`'s `ModelWorker.open_model()`.
+2. Safety latch + REST/bus stop/acknowledge/status — testable with `curl`, no VLM needed.
+3. `SafetyWorker` + config + events.
+4. UI.
+5. Live validation on the SO-101.
+
+## 11. Open questions
+
+- Hazard list and wording of the prompt — confirm with the operator; collect real hazard frames.
+- Should a stop during teleop also latch (`stop_controls`)? Default: model only.
+- Acknowledge permissions: any client, or GUI only?
+- Keep remote-device config file-based, or move it into the database next to remote trainers?
