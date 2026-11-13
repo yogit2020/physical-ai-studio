@@ -63,6 +63,12 @@ arm goes home.
 | 21 | 23:45:47–23:46:27 | New session (`23c170da`), Play, hand in the overhead view | GUI Play | Stop | ❌ **no stop**: the monitor was off in the new session (bug, finding 6). No safety call was made in that session |
 | 22 | after the fix | New session loads the follower's saved monitor settings | unit test `test_a_new_session_watches_with_the_followers_saved_monitor` | Monitor on without a safety call | ✅ fails before the fix, passes after; 112 runtime-session tests pass |
 | 23 | 23:50 | Old vs new scene prompt, offline | `POST /v1/chat/completions` ×210 ([prompt_bench.py](2026-11-12-safety-api-tests/prompt_bench.py)) | Fewer false stops, hands still caught | ✅ see "Scene prompt comparison" |
+| 24 | 23:59 | Restart Studio with the fix; new session; `./safety.sh monitor-on` (new prompt) | `PUT /safety` 00:03:18 | Monitor on in the new session | ✅ new session `4dd7665b` monitored from the start, and the saved prompt is the new one |
+| 25 | 00:07:46–00:07:59 | Full sort with the new prompt | GUI Play | No false stop | ⚠️ cube sorted into the blue bin, then **false stop** `UNSAFE_OBJECT` 0.702 on an empty mat ([wrist](2026-11-12-safety-api-tests/frames/falsestop2-arm-camera.jpg), [overhead](2026-11-12-safety-api-tests/frames/falsestop2-topview.jpg)). Arm started home |
+| 26 | 00:08:02 | Same view while homing | (Qwen, automatic) | No stop | ⚠️ second false stop, 0.752, so the arm froze. Play refused at 00:08:44, acknowledged at 00:08:55 |
+| 27 | 00:09:30–00:09:39 | Hand during a run | (Qwen, automatic) | Stop, then freeze | ✅ `UNSAFE_HAND` 1.0, home, then 1.0 again while homing, so it froze. Acknowledged at 00:10:01 |
+| 28 | 00:10:05–00:10:11 | Run after acknowledge | GUI Play, GUI stop | Runs | ✅ 8 Pi0.5 calls, stopped from the GUI |
+| 29 | 00:32 | Live check time with the new prompt | `GET /safety` ×20 | ~0.5 s | ✅ 470–480 ms, all SAFE (0.62–0.99) |
 
 The event log for the session, oldest first (`GET /safety/events`):
 
@@ -242,9 +248,73 @@ The new prompt is in `application/backend/scripts/safety.sh`. It takes effect wi
 
 ## Not tested yet
 
-- The new scene prompt live on the arm (test 23 was offline).
+- Why the new prompt still stops on an empty mat after the sort (tests 25–26). The cubes in the blue
+  bin or the gripper's shadow on the wrist camera are the likely cause. Next steps: allow "cubes
+  inside a bin" and "the arm's shadow", or set `unsafe_consecutive: 2`.
 - Objects other than a hand (`UNSAFE_OBJECT`: a cup, a phone, a tool).
 - Fail-safe stop: block the Qwen port or freeze a camera, and expect a stop after 2 s.
 - Stop latency measured against camera timestamps.
 - More full sorting episodes with the monitor on (test 17 is one: 0 false stops in 13 s), to get a
   false-stop rate.
+
+## Timing data: Pi0.5 and Qwen
+
+All times measured on 2026-11-12/13. Raw data: [pi_today.csv](2026-11-12-safety-api-tests/pi_today.csv)
+(every live Pi0.5 call), [qwen_live_new_prompt.txt](2026-11-12-safety-api-tests/qwen_live_new_prompt.txt),
+[prompt_bench_results.json](2026-11-12-safety-api-tests/prompt_bench_results.json), [curl_log.txt](2026-11-12-safety-api-tests/curl_log.txt).
+
+### Summary
+
+| Model | Where | Inference time (on GPU) | Latency (round trip, as the caller sees it) | Calls measured |
+|---|---|---|---|---|
+| **Pi0.5** "210base 65ft", OpenVINO | B70 GPU 1, `:18765` | **72.4 ms** mean, 70.7 p50, 72.8 p90, 97.4 max | **96.7 ms** mean, 92.1 p50, 109.4 p90, 306.9 max | 116 live calls in 9 runs |
+| **Qwen** `Qwen3.6-27B-int4-AutoRound`, vLLM | B70 GPU 0, `:18766` | not reported separately: prefill of 2 images + prompt ≈ 0.35 s, then 2–4 output tokens | **474 ms** mean (new prompt), 438 ms (old prompt) | 32 live checks, 210 offline, 6 by `curl` |
+
+### Pi0.5, each live run (Studio → B70 → Studio)
+
+| Run (UTC) | Calls | Inference mean | Inference p90 | Network mean | Total mean | Total p50 | Total p90 | Total max | Ended by |
+|---|---|---|---|---|---|---|---|---|---|
+| 22:58:05–22:58:21 | 18 | 72.1 ms | 73.2 ms | 34.6 ms | 109.3 ms | 94.1 ms | 144.5 ms | 306.9 ms | manual `safety/stop` |
+| 23:08:33–23:08:47 | 16 | 72.2 ms | 71.8 ms | 19.9 ms | 94.0 ms | 90.6 ms | 109.4 ms | 119.1 ms | Qwen: hand |
+| 23:32:05–23:32:18 | 15 | 72.5 ms | 72.8 ms | 20.2 ms | 95.0 ms | 92.5 ms | 106.1 ms | 116.0 ms | GUI stop, **sorted** |
+| 23:40:59–23:41:06 | 9 | 73.6 ms | 97.0 ms | 18.9 ms | 94.6 ms | 91.5 ms | 115.9 ms | 115.9 ms | Qwen: hand |
+| 23:41:35–23:41:38 | 4 | 73.2 ms | 82.0 ms | 24.5 ms | 100.5 ms | 103.1 ms | 113.3 ms | 113.3 ms | Qwen: false stop |
+| 23:46:08–23:46:26 | 21 | 71.7 ms | 72.4 ms | 20.4 ms | 93.8 ms | 92.8 ms | 94.9 ms | 117.9 ms | GUI stop (monitor off, bug) |
+| 00:07:46–00:07:59 | 15 | 72.3 ms | 71.9 ms | 19.6 ms | 93.9 ms | 91.8 ms | 95.5 ms | 120.0 ms | Qwen: false stop, **sorted** |
+| 00:09:30–00:09:38 | 10 | 73.6 ms | 96.2 ms | 18.0 ms | 93.7 ms | 91.4 ms | 116.2 ms | 116.2 ms | Qwen: hand |
+| 00:10:05–00:10:11 | 8 | 71.8 ms | 80.1 ms | 20.2 ms | 94.3 ms | 91.8 ms | 114.1 ms | 114.1 ms | GUI stop |
+| **All** | **116** | **72.4 ms** | **72.8 ms** | **22.2 ms** | **96.7 ms** | **92.1 ms** | **109.4 ms** | **306.9 ms** | |
+
+JPEG encode in Studio: 2.1 ms mean. Payload: ~70–110 KB per call. One call about every 0.93 s. The
+first call of a run is often ~97 ms on the GPU (warm-up); after that it is ~70 ms.
+
+### Pi0.5, direct `curl`
+
+| Call | Inference (server) | Total | Notes |
+|---|---|---|---|
+| `GET /info` | n/a | 7 ms | model, backend, weights fingerprint |
+| `POST /predict` run 1 | 96.2 ms | 117 ms | first call, warm-up |
+| `POST /predict` runs 2–5 | 65.5–66.7 ms | 84–90 ms | 165 KB request (two 640×480 JPEGs), 50 × 6 chunk returned |
+
+### Qwen
+
+| Test | Prompt | Checks | Mean | p50 | p90 | Min | Max | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Live monitor, 23:28 | old | 12 | 438 ms | 432 ms | 434 ms | 429 ms | 503 ms | the 503 ms check was the 0.559 `UNSAFE_OBJECT` |
+| Live monitor, 00:32 | **new** | 20 | **474 ms** | **474 ms** | **477 ms** | 470 ms | 480 ms | all SAFE |
+| Offline bench, 105 pairs | old | 105 | 440 ms | 433 ms | 466 ms | 426 ms | 507 ms | monitor idle, no contention |
+| Offline bench, 105 pairs | new | 105 | 464 ms | 457 ms | 496 ms | 454 ms | 576 ms | the longer prompt adds ~24 ms |
+| Direct `curl`, monitor also running | old | 6 | 0.85 s | | | 0.72 s | 1.14 s | each call waited for a monitor check |
+
+Request size: two 448 px JPEGs (~40–70 KB together) and 551 prompt tokens with the old prompt. The
+reply is 2 tokens for `SAFE` and 4 for `UNSAFE_HAND`.
+
+### Stop timing
+
+| Step | Time |
+|---|---|
+| Qwen check | 0.44–0.48 s |
+| Unsafe verdict → Pi0.5 stopped | < 2 ms (e.g. 23:08:47.853 → .853, 00:09:39.153 → .154) |
+| First stop → second check while homing → freeze | 0.51–0.55 s |
+| Worst case, hazard appears → stop | about one check interval + one check ≈ 0.5 + 0.47 ≈ 1.0 s |
+
