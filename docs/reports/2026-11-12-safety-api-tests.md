@@ -315,6 +315,6 @@ reply is 2 tokens for `SAFE` and 4 for `UNSAFE_HAND`.
 |---|---|
 | Qwen check | 0.44–0.48 s |
 | Unsafe verdict → Pi0.5 stopped | < 2 ms (e.g. 23:08:47.853 → .853, 00:09:39.153 → .154) |
-| First stop → second check while homing → freeze | 0.51–0.55 s |
+| First stop → second check while homing → freeze | 0.51–0.55 s with a hand still in view (23:08:47, 23:41:07, 00:09:39); 3.05 s for the false stop at 00:07:59 → 00:08:02 |
 | Worst case, hazard appears → stop | about one check interval + one check ≈ 0.5 + 0.47 ≈ 1.0 s |
 
