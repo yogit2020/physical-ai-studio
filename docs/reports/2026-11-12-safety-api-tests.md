@@ -69,6 +69,9 @@ arm goes home.
 | 27 | 00:09:30–00:09:39 | Hand during a run | (Qwen, automatic) | Stop, then freeze | ✅ `UNSAFE_HAND` 1.0, home, then 1.0 again while homing, so it froze. Acknowledged at 00:10:01 |
 | 28 | 00:10:05–00:10:11 | Run after acknowledge | GUI Play, GUI stop | Runs | ✅ 8 Pi0.5 calls, stopped from the GUI |
 | 29 | 00:32 | Live check time with the new prompt | `GET /safety` ×20 | ~0.5 s | ✅ 470–480 ms, all SAFE (0.62–0.99) |
+| 30 | 11-16 22:42:42–22:42:56 | Run with the monitor on (new prompt), after reconnecting the tunnel | GUI Play, GUI stop | Runs | ✅ 17 Pi0.5 calls, no stops |
+| 31 | 11-16 22:58:02 | **Turn the safety monitor off** | `PUT /safety {"monitor": {"enabled": false}}` (`./safety.sh monitor-off`) | Saved off for the arm | ✅ `monitor: off`; saved `enabled = false`, so new sessions stay off |
+| 32 | 11-16 22:59:51–23:00:08 | **Run with no safety monitor** | GUI Play, GUI stop | Runs smoothly, hands do not stop it | ✅ 19 Pi0.5 calls, no stops, no Qwen checks |
 
 The event log for the session, oldest first (`GET /safety/events`):
 
@@ -267,7 +270,7 @@ All times measured on 2026-11-12/13. Raw data: [pi_today.csv](2026-11-12-safety-
 
 | Model | Where | Inference time (on GPU) | Latency (round trip, as the caller sees it) | Calls measured |
 |---|---|---|---|---|
-| **Pi0.5** "210base 65ft", OpenVINO | B70 GPU 1, `:18765` | **72.4 ms** mean, 70.7 p50, 72.8 p90, 97.4 max | **96.7 ms** mean, 92.1 p50, 109.4 p90, 306.9 max | 116 live calls in 9 runs |
+| **Pi0.5** "210base 65ft", OpenVINO | B70 GPU 1, `:18765` | **72.3 ms** mean, 70.6 p50, 73.4 p90, 97.4 max | **95.3 ms** mean, 91.6 p50, 104 p90, 306.9 max | 152 live calls in 11 runs |
 | **Qwen** `Qwen3.6-27B-int4-AutoRound`, vLLM | B70 GPU 0, `:18766` | not reported separately: prefill of 2 images + prompt ≈ 0.35 s, then 2–4 output tokens | **474 ms** mean (new prompt), 438 ms (old prompt) | 32 live checks, 210 offline, 6 by `curl` |
 
 ### Pi0.5, each live run (Studio → B70 → Studio)
@@ -283,10 +286,27 @@ All times measured on 2026-11-12/13. Raw data: [pi_today.csv](2026-11-12-safety-
 | 00:07:46–00:07:59 | 15 | 72.3 ms | 71.9 ms | 19.6 ms | 93.9 ms | 91.8 ms | 95.5 ms | 120.0 ms | Qwen: false stop, **sorted** |
 | 00:09:30–00:09:38 | 10 | 73.6 ms | 96.2 ms | 18.0 ms | 93.7 ms | 91.4 ms | 116.2 ms | 116.2 ms | Qwen: hand |
 | 00:10:05–00:10:11 | 8 | 71.8 ms | 80.1 ms | 20.2 ms | 94.3 ms | 91.8 ms | 114.1 ms | 114.1 ms | GUI stop |
-| **All** | **116** | **72.4 ms** | **72.8 ms** | **22.2 ms** | **96.7 ms** | **92.1 ms** | **109.4 ms** | **306.9 ms** | |
+| 11-16 22:42:42–22:42:56 | 17 | 72.2 ms | 73.6 ms | 16.1 ms | 89.9 ms | 88.5 ms | 93.3 ms | 113.2 ms | GUI stop (monitor on) |
+| 11-16 22:59:51–23:00:08 | 19 | 72.0 ms | 73.2 ms | 17.7 ms | 91.6 ms | 90.0 ms | 96.5 ms | 116.2 ms | GUI stop (**monitor off**) |
+| **All** | **152** | **72.3 ms** | **73.4 ms** | **20.9 ms** | **95.3 ms** | **91.6 ms** | **104 ms** | **306.9 ms** | |
 
 JPEG encode in Studio: 2.1 ms mean. Payload: ~70–110 KB per call. One call about every 0.93 s. The
 first call of a run is often ~97 ms on the GPU (warm-up); after that it is ~70 ms.
+
+### With and without the safety monitor
+
+Runs grouped by whether Qwen was checking: the monitor was off for the first run on 11-12 (not yet
+enabled), for 23:46 (the new-session bug), and for 11-16 22:59 (turned off).
+
+| | Runs | Pi0.5 calls | Pi0.5 inference mean / p50 | Pi0.5 total mean / p50 / p90 | Qwen checks | Qwen check time | Safety stops |
+|---|---|---|---|---|---|---|---|
+| **Monitor on** | 8 | 94 | 72.5 / 70.7 ms | 93.7 / 91.4 / 106.1 ms | 2 per second | 438 ms (old prompt), 474 ms (new) | 4 hand (correct), 3 object (false) |
+| **Monitor off** | 3 | 58 | 71.9 / 70.5 ms | 97.9 / 92.1 / 99.3 ms | none | n/a | none |
+
+Pi0.5 runs at the same speed with and without Qwen: the two models are on separate GPUs and Qwen
+never blocks the policy. The higher "off" mean comes from one slow call (306.9 ms) in the first run;
+the medians are 91.4 and 92.1 ms. The monitor's cost is in behaviour, not time: it stops the arm on
+a hand (correct) and sometimes on an empty mat after a sort (false, tests 20, 25, 26).
 
 ### Pi0.5, direct `curl`
 
