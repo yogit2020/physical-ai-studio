@@ -23,7 +23,7 @@ from runtime_session.bus import Bus
 from runtime_session.store import FeatureSpec, Store
 from schemas.runtime_session import CommandDone
 from workers.base import ProcessWorker
-from workers.remote_predictor import REMOTE_DEVICE, RemotePredictor
+from workers.remote_predictor import REMOTE_DEVICE, RemotePredictor, server_url
 from workers.remote_predictor import load_config as load_remote_config
 
 if TYPE_CHECKING:
@@ -119,9 +119,13 @@ class ModelWorker(ProcessWorker[Inference]):
 
     def _open_remote_model(self) -> Predictor:
         config = load_remote_config()
-        if config is None:
-            raise RuntimeError("The remote inference device was chosen, but remote inference is not configured")
-        return RemotePredictor(self.export_dir, config["url"], timing_log=config.get("timing_log"))
+        url = server_url(self.backend, config) if config else None
+        if url is None:
+            raise RuntimeError(
+                f"The remote device was chosen, but no remote {self.backend} server is set: "
+                "enter its host and port where the model is loaded"
+            )
+        return RemotePredictor(self.export_dir, url, timing_log=config.get("timing_log") if config else None)
 
     @asynccontextmanager
     async def lifecycle(self) -> AsyncIterator[Inference]:

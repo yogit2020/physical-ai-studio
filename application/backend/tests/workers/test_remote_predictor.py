@@ -14,9 +14,12 @@ from workers.remote_predictor import (
     CONFIG_FILE,
     REMOTE_DEVICE,
     RemotePredictor,
+    check_server,
     decode_frame,
     encode_frame,
     load_config,
+    save_server,
+    server_url,
     weights_fingerprint,
 )
 
@@ -121,16 +124,63 @@ def test_another_model_on_the_server_is_refused(tmp_path: Path, server: _FakePol
         RemotePredictor(other, server.url)
 
 
-def test_the_remote_device_is_listed_only_when_configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_remote_device_is_listed_per_backend_set_or_not(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STORAGE_DIR", str(tmp_path))
     monkeypatch.setattr(SystemService, "_get_torch_inference_devices", classmethod(lambda cls: []))
     monkeypatch.setattr(SystemService, "_get_openvino_inference_devices", classmethod(lambda cls: []))
     assert load_config() is None
-    assert SystemService.get_inference_devices() == []
+    # Listed unset, so the host and port can be entered where the model is loaded.
+    names = {device.backend: device.name for device in SystemService.get_inference_devices()}
+    assert names == {
+        InferenceBackend.OPENVINO: "Remote server (set host and port)",
+        InferenceBackend.TORCH: "Remote server (set host and port)",
+    }
 
-    (tmp_path / CONFIG_FILE).write_text(json.dumps({"url": "http://127.0.0.1:1", "name": "B70 (remote)"}))
-    (device,) = SystemService.get_inference_devices()
-    assert (device.backend, device.device, device.name) == (InferenceBackend.OPENVINO, REMOTE_DEVICE, "B70 (remote)")
+    save_server("torch", "10.0.0.5", 18767)
+    devices = {device.backend: device for device in SystemService.get_inference_devices()}
+    assert devices[InferenceBackend.TORCH].device == REMOTE_DEVICE
+    assert devices[InferenceBackend.TORCH].name == "Remote server (10.0.0.5:18767)"
+    assert devices[InferenceBackend.OPENVINO].name == "Remote server (set host and port)"
+
+
+def test_each_backend_keeps_its_own_server(tmp_path: Path) -> None:
+    save_server("openvino", "172.18.0.1", 18765, tmp_path)
+    save_server("torch", "172.18.0.1", 18767, tmp_path)
+    config = load_config(tmp_path)
+    assert server_url("openvino", config) == "http://172.18.0.1:18765"
+    assert server_url("torch", config) == "http://172.18.0.1:18767"
+    save_server("torch", "10.0.0.9", 9000, tmp_path)  # replacing one leaves the other
+    config = load_config(tmp_path)
+    assert server_url("openvino", config) == "http://172.18.0.1:18765"
+    assert server_url("torch", config) == "http://10.0.0.9:9000"
+
+
+def test_the_one_server_config_still_works_and_survives_a_save(tmp_path: Path) -> None:
+    old = {"url": "http://172.18.0.1:18765", "name": "B70", "timing_log": "/x.csv"}
+    (tmp_path / CONFIG_FILE).write_text(json.dumps(old))
+    assert server_url("openvino", load_config(tmp_path)) == "http://172.18.0.1:18765"
+    assert server_url("torch", load_config(tmp_path)) is None
+
+    config = save_server("torch", "172.18.0.1", 18767, tmp_path)
+    assert config["timing_log"] == "/x.csv" and config["name"] == "B70"
+    assert server_url("openvino", config) == "http://172.18.0.1:18765"
+    assert server_url("torch", config) == "http://172.18.0.1:18767"
+
+
+def test_checking_a_server_reports_what_it_runs(tmp_path: Path, export: Path, server: _FakePolicyServer) -> None:
+    result = check_server(server.url, export)
+    assert result["ok"] and result["same_model"] is True
+    assert (result["backend"], result["device"], result["server_host"]) == ("openvino", "GPU", "b70")
+    assert result["latency_ms"] >= 0
+
+    other = _export(tmp_path / "other" / "openvino", b"other" * 1000)
+    assert check_server(server.url, other)["same_model"] is False
+    assert check_server(server.url)["same_model"] is None  # no model asked about
+
+
+def test_checking_a_server_that_is_down_reports_it() -> None:
+    result = check_server("http://127.0.0.1:1", timeout_s=1)
+    assert result["ok"] is False and result["error"]
 
 
 def test_an_unreadable_config_is_ignored(tmp_path: Path) -> None:

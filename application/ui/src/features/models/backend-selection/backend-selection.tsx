@@ -3,6 +3,7 @@ import { Flex, Item, Picker, RadioGroup, Text } from '@geti-ui/ui';
 import { $api } from '../../../api/client';
 import { SchemaInferenceDeviceInfo, SchemaModel } from '../../../api/openapi-spec';
 import { BackendOption } from './backend-option';
+import { REMOTE_DEVICE, RemoteServerFields } from './remote-server-fields';
 
 export const defaultBackend = 'openvino';
 
@@ -52,8 +53,9 @@ export const getSupportedInferenceDevices = (devices: SchemaInferenceDeviceInfo[
 export const getDefaultInferenceDevice = (devices: SchemaInferenceDeviceInfo[], backend: string) => {
     const supportedDevices = getSupportedInferenceDevices(devices, backend);
 
-    // Prefer hardware acceleration
-    return supportedDevices.find((device) => device.type !== 'cpu') ?? supportedDevices.at(0);
+    // Prefer local hardware acceleration; a remote server is only used when picked.
+    const local = supportedDevices.filter((device) => device.device !== REMOTE_DEVICE);
+    return local.find((device) => device.type !== 'cpu') ?? local.at(0) ?? supportedDevices.at(0);
 };
 
 interface BackendSelectionProps {
@@ -122,6 +124,9 @@ export const BackendSelection = ({
                     </Item>
                 ))}
             </Picker>
+            {selectedDevice?.device === REMOTE_DEVICE && (backend === 'openvino' || backend === 'torch') && (
+                <RemoteServerFields backend={backend} modelId={model.id ?? undefined} />
+            )}
         </Flex>
     );
 };

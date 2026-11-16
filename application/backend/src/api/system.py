@@ -6,17 +6,20 @@
 import asyncio
 import os
 import signal
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, status
 from pydantic import BaseModel
 
-from api.dependencies import HealthServiceDep, get_system_service
+from api.dependencies import HealthServiceDep, ModelServiceDep, get_system_service
 from build_info import get_build_info_async
-from schemas.hardware import InferenceDeviceInfo, TrainingDevices
+from schemas.hardware import InferenceBackend, InferenceDeviceInfo, TrainingDevices
+from schemas.remote_inference import RemoteInferenceConfig, RemoteServer, RemoteServerCheck, RemoteServerCheckRequest
 from schemas.video_recording import VideoRecordingPresets
 from services.system_service import SystemService
 from settings import get_settings
+from workers import remote_predictor
 
 system_router = APIRouter(prefix="/api/system", tags=["System"])
 
@@ -57,6 +60,45 @@ async def get_inference_devices(
 ) -> list[InferenceDeviceInfo]:
     """Returns the list of available inference devices for OpenVINO and Torch."""
     return system_service.get_inference_devices()
+
+
+def _remote_config_view(config: dict | None) -> RemoteInferenceConfig:
+    servers = {}
+    for backend in InferenceBackend:
+        address = remote_predictor.server_address(backend.value, config or {})
+        if address is not None:
+            servers[backend] = RemoteServer(host=address[0], port=address[1])
+    return RemoteInferenceConfig(servers=servers)
+
+
+@system_router.get("/remote-inference")
+async def get_remote_inference() -> RemoteInferenceConfig:
+    """The remote policy server set for each backend."""
+    return _remote_config_view(remote_predictor.load_config())
+
+
+@system_router.put("/remote-inference/{backend}")
+async def set_remote_inference_server(backend: InferenceBackend, server: RemoteServer) -> RemoteInferenceConfig:
+    """Set the remote policy server a model on ``backend`` runs on when loaded on the remote device."""
+    config = await asyncio.to_thread(remote_predictor.save_server, backend.value, server.host, server.port)
+    return _remote_config_view(config)
+
+
+@system_router.post("/remote-inference/check")
+async def check_remote_inference_server(
+    request: RemoteServerCheckRequest, model_service: ModelServiceDep
+) -> RemoteServerCheck:
+    """Connect to a remote policy server and report what it runs.
+
+    With ``model_id`` and ``backend``, also compare its weights with that model's export, so a
+    server running another model is caught before the robot is driven.
+    """
+    export_dir = None
+    if request.model_id is not None and request.backend is not None:
+        model = await model_service.get_model_by_id(request.model_id)
+        export_dir = Path(model.path) / "exports" / request.backend.value
+    url = f"http://{request.host}:{request.port}"
+    return RemoteServerCheck(**await asyncio.to_thread(remote_predictor.check_server, url, export_dir))
 
 
 @system_router.get("/devices/training")

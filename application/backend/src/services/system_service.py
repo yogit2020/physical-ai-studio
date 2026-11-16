@@ -14,7 +14,7 @@ from loguru import logger
 from internal_datasets.lerobot.video_encoding_settings import available_video_encoding_presets
 from schemas.hardware import DeviceInfo, DeviceType, InferenceBackend, InferenceDeviceInfo, TrainingDevices
 from schemas.video_recording import VideoRecordingPreset, VideoRecordingPresets
-from workers.remote_predictor import REMOTE_DEVICE
+from workers.remote_predictor import REMOTE_DEVICE, server_address
 from workers.remote_predictor import load_config as load_remote_config
 
 
@@ -36,20 +36,23 @@ class SystemService:
 
     @staticmethod
     def _get_remote_inference_devices() -> list[InferenceDeviceInfo]:
-        """The remote policy server's accelerator, when remote inference is configured."""
-        config = load_remote_config()
-        if config is None:
-            return []
-        return [
-            InferenceDeviceInfo(
-                backend=InferenceBackend(config.get("backend", InferenceBackend.OPENVINO)),
-                device=REMOTE_DEVICE,
-                type=DeviceType.XPU,
-                name=config.get("name", f"Remote ({config['url']})"),
-                memory=config.get("memory"),
-                index=None,
+        """A remote policy server per backend; listed unset too, so one can be set where a model loads."""
+        config = load_remote_config() or {}
+        devices = []
+        for backend in (InferenceBackend.OPENVINO, InferenceBackend.TORCH):
+            address = server_address(backend.value, config)
+            name = f"Remote server ({address[0]}:{address[1]})" if address else "Remote server (set host and port)"
+            devices.append(
+                InferenceDeviceInfo(
+                    backend=backend,
+                    device=REMOTE_DEVICE,
+                    type=DeviceType.XPU,
+                    name=name,
+                    memory=config.get("memory"),
+                    index=None,
+                )
             )
-        ]
+        return devices
 
     @staticmethod
     def get_video_recording_presets() -> VideoRecordingPresets:

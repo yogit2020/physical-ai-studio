@@ -5,11 +5,14 @@ The robot and cameras stay on this machine. A ``ModelWorker`` whose device is
 (usually reached through an SSH tunnel) and gets the action chunk back, so to the
 rest of the session a remote model is any other model.
 
-Enabled by ``remote_inference.json`` in the storage directory, so it needs no new
-environment variables and survives restarts::
+Configured in ``remote_inference.json`` in the storage directory, so it survives restarts.
+Each backend has its own server, set from the UI (``PUT /api/system/remote-inference/{backend}``)::
 
-    {"url": "http://172.18.0.1:18765", "name": "Arc Pro B70 (remote)", "memory": 34242297856,
-     "timing_log": "/app/storage/remote_inference_timing.csv"}
+    {"servers": {"openvino": {"host": "172.18.0.1", "port": 18765},
+                 "torch": {"host": "172.18.0.1", "port": 18767}},
+     "name": "Arc Pro B70", "memory": 34242297856, "timing_log": "/app/storage/remote_inference_timing.csv"}
+
+The older one-server form, ``{"url": ..., "backend": "openvino"}``, still works for its backend.
 """
 
 from __future__ import annotations
@@ -49,7 +52,75 @@ def load_config(storage_dir: Path | None = None) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError) as error:
         logger.warning("Ignoring unreadable remote inference config {}: {}", path, error)
         return None
-    return config if isinstance(config, dict) and config.get("url") else None
+    return config if isinstance(config, dict) and (config.get("url") or config.get("servers")) else None
+
+
+def server_url(backend: str, config: dict[str, Any] | None = None) -> str | None:
+    """The URL of the remote server for ``backend``, or ``None`` when none is set."""
+    config = load_config() if config is None else config
+    if not config:
+        return None
+    server = (config.get("servers") or {}).get(backend)
+    if server:
+        return f"http://{server['host']}:{server['port']}"
+    if config.get("url") and config.get("backend", "openvino") == backend:
+        return str(config["url"])
+    return None
+
+
+def server_address(backend: str, config: dict[str, Any] | None = None) -> tuple[str, int] | None:
+    """``(host, port)`` of the remote server for ``backend``, or ``None`` when none is set."""
+    url = server_url(backend, config)
+    if url is None:
+        return None
+    parsed = httpx.URL(url)
+    return parsed.host, parsed.port or 80
+
+
+def save_server(backend: str, host: str, port: int, storage_dir: Path | None = None) -> dict[str, Any]:
+    """Set the remote server for ``backend``, keeping the rest of the config. Returns the new config."""
+    path = (storage_dir or get_settings().storage_dir) / CONFIG_FILE
+    config = load_config(storage_dir) or {}
+    servers = dict(config.get("servers") or {})
+    # The one-server form becomes an entry, so saving one backend does not lose the other.
+    if config.get("url") and config.get("backend", "openvino") not in servers:
+        old = httpx.URL(str(config["url"]))
+        servers[config.get("backend", "openvino")] = {"host": old.host, "port": old.port or 80}
+    servers[backend] = {"host": host, "port": port}
+    config = {key: value for key, value in config.items() if key not in ("url", "backend")}
+    config["servers"] = servers
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_suffix(".tmp")
+    staged.write_text(json.dumps(config, indent=2))
+    staged.replace(path)
+    return config
+
+
+def check_server(url: str, export_dir: Path | None = None, *, timeout_s: float = 5.0) -> dict[str, Any]:
+    """Ask a remote policy server what it runs; with ``export_dir``, whether it is that model.
+
+    Never raises: an unreachable or odd server is reported in ``error``.
+    """
+    started = time.perf_counter()
+    try:
+        with httpx.Client(base_url=url, timeout=timeout_s, trust_env=False) as client:
+            info = client.get("/info").raise_for_status().json()
+    except (httpx.HTTPError, ValueError) as error:
+        return {"ok": False, "url": url, "error": f"{type(error).__name__}: {error}"}
+    latency_ms = (time.perf_counter() - started) * 1000
+    same_model = None
+    if export_dir is not None and (export_dir / "manifest.json").is_file():
+        same_model = info.get("fingerprint") == weights_fingerprint(export_dir)
+    return {
+        "ok": True,
+        "url": url,
+        "latency_ms": round(latency_ms, 1),
+        "server_host": info.get("host"),
+        "backend": info.get("backend"),
+        "device": info.get("device"),
+        "fingerprint": info.get("fingerprint"),
+        "same_model": same_model,
+    }
 
 
 def weights_fingerprint(export_dir: Path) -> str:
