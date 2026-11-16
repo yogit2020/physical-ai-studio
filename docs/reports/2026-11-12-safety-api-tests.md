@@ -338,3 +338,67 @@ reply is 2 tokens for `SAFE` and 4 for `UNSAFE_HAND`.
 | First stop → second check while homing → freeze | 0.51–0.55 s with a hand still in view (23:08:47, 23:41:07, 00:09:39); 3.05 s for the false stop at 00:07:59 → 00:08:02 |
 | Worst case, hazard appears → stop | about one check interval + one check ≈ 0.5 + 0.47 ≈ 1.0 s |
 
+
+## PyTorch serving on the B70 (2026-11-16)
+
+Pi0.5 served from the **PyTorch export** of the same model, next to the OpenVINO one, and picked in
+Studio by entering a server's host and port (design §3.4).
+
+### Which model, which server
+
+| | OpenVINO (until now) | PyTorch (new) |
+|---|---|---|
+| Model files | `muniker/pi05-so101-sort-210base-65ft` · `exports/openvino/` | same repo · `exports/torch/pi05.pt` (8.29 GB, sha256 `828e65dc…` = Hugging Face) |
+| Server | `remote_policy_server.py --backend openvino --device GPU` | `remote_policy_server.py --backend torch --device xpu` ([start_torch.sh](2026-11-12-safety-api-tests/pytorch/start_torch.sh)) |
+| B70 container, GPU, port | `yogini-pi05-server`, GPU 1, 18765 | `yogini-pi05-torch`, GPU 1, **18767** |
+| Conversion needed | none | **none**: Studio's own runtime reads its PyTorch export. Only the PaliGemma tokenizer has to be mounted, since the PyTorch export does not bundle one |
+
+openpi (PR #1009) is a different server that only reads openpi checkpoints; using it for this
+model would need a conversion. Its own LIBERO demo was run to check the B70 setup: test 33.
+
+### Tests
+
+| # | Test | Result |
+|---|---|---|
+| 33 | openpi PR #1009 `docs/xpu.md` steps 1–5 on the B70 (branch `35213e6`, `torch 2.11.0+xpu`, `pi05_libero`) | ✅ steps 1–4 already done; step 5 smoke test **126 ms** client / **120 ms** policy (guide: ~130 / ~124). First call compiles for ~6 min (`max-autotune`); the client's keepalive timed out during it, a second run worked |
+| 34 | PyTorch export served on XPU | ✅ loads in 99 s; 50×6 chunk |
+| 35 | Same input to both servers, through `curl` | ✅ both answer; PyTorch differs call to call (it draws new start noise), OpenVINO does not (its old export repeats one in-graph noise) |
+| 36 | **Same input and same start noise** to both ([parity.py](2026-11-12-safety-api-tests/pytorch/parity.py), 3 dataset moments × 3 noises) | ✅ **same model**: see the table below |
+| 37 | Remote server per backend, set and checked through the new API | ✅ both servers report `same_model: true`; the PyTorch model against the OpenVINO port reports `same_model: false`; `http://x` as host is refused |
+| 38 | One prediction through Studio's own client (`RemotePredictor`, the path Play uses) | ✅ OpenVINO 84–88 ms, PyTorch 344–357 ms (3.2 s first call) |
+
+### Same model? (test 36)
+
+Differences in joint units (degrees) over the whole 50×6 chunk:
+
+| | Mean difference | Max difference |
+|---|---|---|
+| **OpenVINO vs PyTorch, same noise** | **0.05–0.14** | **0.21–0.51** |
+| PyTorch vs itself, same noise | | 0.19 |
+| OpenVINO vs itself, same noise | | 0.02 |
+| One backend, two different noises (what normal sampling changes) | 0.81–0.82 | 4.7–4.9 |
+
+With the same noise the two backends differ about 6–16 times less than two samples of one backend,
+so they are the same model; what remains is numeric precision on the GPU. Per-case numbers:
+[parity_results_fixed_noise.json](2026-11-12-safety-api-tests/pytorch/parity_results_fixed_noise.json).
+
+### Inference time and latency
+
+| | Inference on the GPU | Round trip from Studio | First call |
+|---|---|---|---|
+| **OpenVINO** (`pi05.xml`, GPU) | **65–69 ms** | **84–90 ms** | 0.1–0.35 s |
+| **PyTorch** (`pi05.pt`, XPU) | **330–341 ms** | **344–357 ms** | 2.3–3.4 s |
+| openpi PyTorch, LIBERO demo (other model, chunk 10 not 50, compiled `max-autotune`) | 120 ms | 126 ms | ~6 min compile |
+
+PyTorch is about **5× slower** than OpenVINO. Studio's PyTorch runtime does not compile the model
+(`compile_model=False`); openpi's compiled run suggests most of the gap can be closed.
+
+### Found along the way
+
+- The OpenVINO export on the B70 is the older kind that **samples its start noise inside the graph**,
+  and Intel's GPU plugin returns the same values on every call. So every OpenVINO chunk until now
+  started from one fixed noise. Studio can rewrite the export to take the noise as an input
+  (`python -m physicalai.policies.pi05.noise_input`), and test 36 used such a copy. The original
+  export is unchanged.
+- Studio's PyTorch runtime drops a `noise` input before the model, so a PyTorch export always
+  draws its own noise. The parity test replaced the model's `sample_noise` to feed it the same noise.

@@ -200,6 +200,40 @@ curl -X POST http://172.18.0.1:18766/v1/chat/completions -H 'Content-Type: appli
 \* Called by hand while the monitor was also checking twice a second, so the call queued behind it.
 The monitor's own checks take 0.43 s.
 
+### 3.4 Choosing the remote server in the UI
+
+Each backend has its own remote server, so OpenVINO and PyTorch can be served side by side and
+picked per run. Where a model is loaded (**Models → Start inference**, or **Load model** in a
+session), choosing the device **Remote server (…)** shows:
+
+```
+┌ Inference device ────────────────────────────────────┐
+│ [Remote server (172.18.0.1:18767) ▾]                 │
+│ Remote server host            Port                   │
+│ [172.18.0.1          ]        [18767]                │
+│ For example 172.18.0.1                               │
+│ [Test connection]  ✓ Connected (torch on xpu, 12 ms), same model │
+└──────────────────────────────────────────────────────┘
+```
+
+- **Test connection** saves the host and port for that backend, then asks the server what it runs
+  (`GET /info`) and compares its weights with the model being loaded. A server running another model
+  shows ⚠, and loading would be refused anyway.
+- The remote device is listed even before a server is set ("Remote server (set host and port)"), and
+  it is never picked automatically.
+
+| Method | Path | Body | Does |
+|---|---|---|---|
+| `GET` | `/api/system/remote-inference` | | The server set for each backend |
+| `PUT` | `/api/system/remote-inference/{openvino\|torch}` | `{"host": "172.18.0.1", "port": 18767}` | Set one backend's server (host without `http://`, port 1–65535) |
+| `POST` | `/api/system/remote-inference/check` | `{"host", "port", "model_id"?, "backend"?}` | Reachable? latency, backend, device, and `same_model` |
+
+They are stored in `remote_inference.json` as `{"servers": {"openvino": {...}, "torch": {...}}}`; the
+older one-server form (`{"url": ...}`) still works and is converted on the first save.
+
+Current B70 servers: OpenVINO `172.18.0.1:18765` (65 ms on the GPU), PyTorch `172.18.0.1:18767`
+(330 ms). Both are the same model (report test 36).
+
 ## 4. Components
 
 ### 4.1 Remote policy inference (`RemotePredictor`)
