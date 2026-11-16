@@ -270,7 +270,7 @@ All times measured on 2026-11-12/13. Raw data: [pi_today.csv](2026-11-12-safety-
 
 | Model | Where | Inference time (on GPU) | Latency (round trip, as the caller sees it) | Calls measured |
 |---|---|---|---|---|
-| **Pi0.5** "210base 65ft", OpenVINO | B70 GPU 1, `:18765` | **72.3 ms** mean, 70.6 p50, 73.4 p90, 97.4 max | **95.3 ms** mean, 91.6 p50, 104 p90, 306.9 max | 152 live calls in 11 runs |
+| **Pi0.5** "210base 65ft", OpenVINO | B70 GPU 1, `:18765` | **72.3 ms** mean, 70.6 p50, 73.2 p90, 97.4 max | **95.3 ms** mean, 91.6 p50, 103.1 p90, 306.9 max | 152 live calls in 11 runs |
 | **Qwen** `Qwen3.6-27B-int4-AutoRound`, vLLM | B70 GPU 0, `:18766` | not reported separately: prefill of 2 images + prompt ≈ 0.35 s, then 2–4 output tokens | **474 ms** mean (new prompt), 438 ms (old prompt) | 32 live checks, 210 offline, 6 by `curl` |
 
 ### Pi0.5, each live run (Studio → B70 → Studio)
@@ -288,7 +288,7 @@ All times measured on 2026-11-12/13. Raw data: [pi_today.csv](2026-11-12-safety-
 | 00:10:05–00:10:11 | 8 | 71.8 ms | 80.1 ms | 20.2 ms | 94.3 ms | 91.8 ms | 114.1 ms | 114.1 ms | GUI stop |
 | 11-16 22:42:42–22:42:56 | 17 | 72.2 ms | 73.6 ms | 16.1 ms | 89.9 ms | 88.5 ms | 93.3 ms | 113.2 ms | GUI stop (monitor on) |
 | 11-16 22:59:51–23:00:08 | 19 | 72.0 ms | 73.2 ms | 17.7 ms | 91.6 ms | 90.0 ms | 96.5 ms | 116.2 ms | GUI stop (**monitor off**) |
-| **All** | **152** | **72.3 ms** | **73.4 ms** | **20.9 ms** | **95.3 ms** | **91.6 ms** | **104 ms** | **306.9 ms** | |
+| **All** | **152** | **72.3 ms** | **73.2 ms** | **21.0 ms** | **95.3 ms** | **91.6 ms** | **103.1 ms** | **306.9 ms** | |
 
 JPEG encode in Studio: 2.1 ms mean. Payload: ~70–110 KB per call. One call about every 0.93 s. The
 first call of a run is often ~97 ms on the GPU (warm-up); after that it is ~70 ms.
