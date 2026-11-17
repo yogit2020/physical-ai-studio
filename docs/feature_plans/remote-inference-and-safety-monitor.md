@@ -6,6 +6,7 @@ Status: draft, 2026-11-12. Branch `feature/remote-inference-safety` (from `main`
 |---|---|
 | **Branch** | [`yogit2020/physical-ai-studio` · `feature/remote-inference-safety`](https://github.com/yogit2020/physical-ai-studio/tree/feature/remote-inference-safety) |
 | **Open a PR** | [compare with `main`](https://github.com/yogit2020/physical-ai-studio/compare/main...feature/remote-inference-safety) (not opened yet) |
+| **Test report** | [`docs/reports/2026-11-17-remote-inference-test-report.md`](../reports/2026-11-17-remote-inference-test-report.md): summary of all tests, inference time and latency for Pi0.5 (OpenVINO and PyTorch) and Qwen, with safety on and off, and screenshots of the remote server UI |
 | **Tests done** | [`docs/reports/2026-11-12-safety-api-tests.md`](../reports/2026-11-12-safety-api-tests.md): 23 tests on the live SO-101 and offline. Studio safety API, direct `curl` calls to Pi0.5 and Qwen with timings, real hand stops, one false stop, a full sort, and the scene prompt comparison |
 | **Unit tests** | `application/backend/tests/runtime_session/test_safety.py`, `test_safety_monitor.py` (112 runtime-session tests pass) |
 | **Shell tool** | `application/backend/scripts/safety.sh` (status, stop, ack, home, monitor-on, events, frames) |

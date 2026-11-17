@@ -366,6 +366,8 @@ model would need a conversion. Its own LIBERO demo was run to check the B70 setu
 | 36 | **Same input and same start noise** to both ([parity.py](2026-11-12-safety-api-tests/pytorch/parity.py), 3 dataset moments × 3 noises) | ✅ **same model**: see the table below |
 | 37 | Remote server per backend, set and checked through the new API | ✅ both servers report `same_model: true`; the PyTorch model against the OpenVINO port reports `same_model: false`; `http://x` as host is refused |
 | 38 | One prediction through Studio's own client (`RemotePredictor`, the path Play uses) | ✅ OpenVINO 84–88 ms, PyTorch 344–357 ms (3.2 s first call) |
+| 39 | 11-17 00:14:35–00:17:20 | PyTorch on the arm: safety off (00:14, 16 calls), then on (00:16, 10 calls; 00:17, 9 calls) | ✅ 341 ms on the GPU, ~360 ms round trip either way. 00:16:27 hand stop (100%), freeze 0.55 s later; acknowledged 00:17:04 |
+| 40 | 11-17 00:30 | New UI in a real browser (Playwright) | ✅ both servers "Connected, same model"; screenshots in [2026-11-17-remote-inference-test-report.md](2026-11-17-remote-inference-test-report.md) |
 
 ### Same model? (test 36)
 
