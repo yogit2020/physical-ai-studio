@@ -40,7 +40,9 @@ the API, so the stop path is independent of Qwen.
 | Card | Model | Serving | Memory | Measured / expected |
 |---|---|---|---|---|
 | B70 GPU 1 (PCI 54:00.0) | Pi0.5 "210base 65ft", OpenVINO export | `remote_policy_server.py` | ~6.4 GB | 66–72 ms inference, **102 ms** end to end from Studio (live run, 2026-11-06) |
-| B70 GPU 0 (PCI 18:00.0) | `Intel/Qwen3.6-27B-int4-AutoRound` (vision kept bf16) | vLLM 0.32 XPU, OpenAI API | 17.7 GiB weights, 79% cap, 1.7 GiB KV | **494 ms** per check (p90 504 ms), one-word verdict (2026-11-12) |
+| B70 GPU 1 (PCI 54:00.0) | Pi0.5 "210base 65ft", PyTorch export | `remote_policy_server.py --compile --warmup` | 10.4 GiB | **93 ms** inference, **115 ms** end to end; ~5 min to start (2026-11-17) |
+| B70 GPU 0 (PCI 18:00.0) | **`cyankiwi/Qwen3.8-27B-AWQ-INT4`** (W4A16, group 32), current since 2026-11-17 | vLLM 0.32 XPU, OpenAI API | 19.75 GiB used, 80% cap, 2,048-token context, 1 request at a time | **545 ms** per check (median); 0 false stops on the test set |
+| B70 GPU 0 (PCI 18:00.0) | `Intel/Qwen3.6-27B-int4-AutoRound` (vision kept bf16), until 2026-11-17 | vLLM 0.32 XPU, OpenAI API | 17.7 GiB weights, 79% cap, 1.7 GiB KV | **494 ms** per check (p90 504 ms), one-word verdict (2026-11-12) |
 
 Measured 2026-11-12 on 30 normal frames of the sorting dataset (no hazards present):
 
@@ -56,7 +58,10 @@ Decode is ~35 ms/token, so output length dominates; prefill of two 448 px images
 is ~0.35 s. vLLM must be started with `--max-model-len 4096 --mm-processor-kwargs '{"max_pixels": 200704}'`
 or its profiling leaves no KV cache on a card with the 6 GB baseline.
 
-Fallback monitor models if Qwen3.6-27B INT4 is too slow: `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.5-4B`.
+Qwen3.8-27B AWQ replaced Qwen3.6 on 2026-11-17: on the same safety frames it made no false stops
+(Qwen3.6: 1 of 101, and 2 of the 3 real false stops) and caught all 5 hands, at +85 ms per check
+(test report, section 4.5). `start_qwen.sh` on the B70 restores Qwen3.6. Smaller fallbacks if a
+model is too slow: `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.5-4B`.
 Each card carries ~6.2 GB of baseline driver usage, so ~25.7 GiB is usable per card; FP8 27B (28.7 GiB)
 does not fit.
 
@@ -90,13 +95,13 @@ Two AI models run side by side on the B70. Studio talks to both over an SSH tunn
 
 | | **Pi0.5** (the driver) | **Qwen** (the safety watcher) |
 |---|---|---|
-| Model | Pi0.5 "210base 65ft", OpenVINO export | `Qwen3.6-27B-int4-AutoRound`, served as `qwen-safety` by vLLM |
-| Runs on | B70 GPU 1, port `18765` | B70 GPU 0, port `18766` |
+| Model | Pi0.5 "210base 65ft": OpenVINO export, or PyTorch export (compiled) | `Qwen3.8-27B-AWQ-INT4`, served as `qwen-safety` by vLLM |
+| Runs on | B70 GPU 1, port `18765` (OpenVINO) or `18767` (PyTorch) | B70 GPU 0, port `18766` |
 | Gets | joint state + 2 camera images + task text | 2 camera images (448 px) + scene prompt |
 | Returns | 50 joint targets (an action chunk) | one word: `SAFE`, `UNSAFE_HAND` or `UNSAFE_OBJECT` |
 | How often | when the action queue runs out (~1 per second) | twice a second (2 Hz) |
-| Inference time (on GPU) | **66–72 ms** | ~0.35 s prefill + 2–4 tokens |
-| Latency seen by Studio | **~100 ms** (mean 100, p50 92 ms, 49 live calls) | **~0.43 s** (429–503 ms) |
+| Inference time (on GPU) | **66–72 ms** OpenVINO, **93 ms** PyTorch | prefill of 2 images + prompt, then 2–4 tokens |
+| Latency seen by Studio | **~95 ms** OpenVINO (152 live calls), **~115 ms** PyTorch | **~0.55 s** (Qwen3.8; Qwen3.6 was ~0.47 s) |
 
 Measured 2026-11-12 to 11-17; see `docs/reports/2026-11-17-remote-inference-test-report.md`.
 
@@ -232,7 +237,7 @@ They are stored in `remote_inference.json` as `{"servers": {"openvino": {...}, "
 older one-server form (`{"url": ...}`) still works and is converted on the first save.
 
 Current B70 servers: OpenVINO `172.18.0.1:18765` (65 ms on the GPU), PyTorch `172.18.0.1:18767`
-(330 ms). Both are the same model (test report, section 4.3).
+(93 ms with `torch.compile`). Both are the same model (test report, section 4.3).
 
 ## 4. Components
 
@@ -635,7 +640,7 @@ Acknowledge sends the right command without starting control.
 
 ## 10. Phases
 
-0. Serve Qwen3.6-27B INT4 on GPU 0, benchmark; choose the monitor model. *(done; hazard frames still to test)*
+0. Serve Qwen3.6-27B INT4 on GPU 0, benchmark; choose the monitor model. *(done; replaced by Qwen3.8-27B AWQ on 2026-11-17)*
 1. Port remote policy inference to `main`'s `ModelWorker.open_model()`. *(done, 4e093cc7)*
 2. Safety latch + REST/bus stop/acknowledge/status — testable with `curl`, no VLM needed. *(done, 6ff0bc88)*
 3. `SafetyMonitor` + config + events. *(done)*
