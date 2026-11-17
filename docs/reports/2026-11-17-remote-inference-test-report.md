@@ -4,10 +4,8 @@
 **Branch:** [`yogit2020/physical-ai-studio` · `feature/remote-inference-safety`](https://github.com/yogit2020/physical-ai-studio/tree/feature/remote-inference-safety)
 
 This report sums up everything tested: the two AI models, how fast they are, what the safety
-monitor did on the real arm, the bugs found, and the new UI for picking a remote server. Each test
-is listed in detail, with logs, in [2026-11-12-safety-api-tests.md](2026-11-12-safety-api-tests.md)
-(tests 1–38). The design is in
-[remote-inference-and-safety-monitor.md](../feature_plans/remote-inference-and-safety-monitor.md).
+monitor did on the real arm, the bugs found, and the new UI for picking a remote server. The design
+is in [remote-inference-and-safety-monitor.md](../feature_plans/remote-inference-and-safety-monitor.md).
 
 ## 1. Summary
 
@@ -50,27 +48,29 @@ is listed in detail, with logs, in [2026-11-12-safety-api-tests.md](2026-11-12-s
 
 ## 3. What we tested
 
-| Area | Tests | What was checked | Result |
-|---|---|---|---|
-| **Studio safety API** | 1–7, 11, 16, 31 | capture home, manual stop, Play refused while latched, acknowledge, events, stop frames, monitor on/off | ✅ all calls work on the real arm |
-| **Models by direct `curl`** | 13–14 | Pi0.5 `/info` + `/predict`, Qwen `/v1/chat/completions` on hand and clean frames | ✅ Pi0.5 50×6 chunk; Qwen 6/6 correct |
-| **Live runs, OpenVINO** | 3, 8, 17, 18–20, 25–28, 30, 32 | 11 runs on the arm, with the monitor on and off, incl. full sorts | ✅ cubes sorted; see the timing tables |
-| **Hand stops** | 9–10, 18–19, 27, 39 | hand in view while Pi0.5 drives | ✅ 4/4 stopped; arm went home, froze when the hand stayed |
-| **False stops** | 15, 20, 25–26 | stops with no hazard | ⚠️ 3 live (0.70–0.75 confidence), 1 near miss (0.559) |
-| **Scene prompt** | 23 | old vs new prompt on 101 dataset frame pairs + 4 hand stops | ✅ false stops 5 → 1, all hands still caught |
-| **New-session bug** | 21–22, 24 | a newly opened session monitored nothing | ✅ fixed and covered by a unit test |
-| **openpi PR #1009** | 33 | `docs/xpu.md` steps 1–5 on the B70 (openpi's LIBERO demo) | ✅ 126 ms / 120 ms, as the guide expects |
-| **PyTorch export** | 34–35, 38 | Pi0.5 `pi05.pt` served on XPU; Studio's own client | ✅ works, ~5× slower than OpenVINO |
-| **Same model check** | 36 | OpenVINO vs PyTorch, same frames, state and noise | ✅ same model (section 4.3) |
-| **Remote server API + UI** | 37, 40 | host/port per backend, Test connection, wrong-model warning, screenshots | ✅ section 5 |
-| **PyTorch on the arm** | 39 | PyTorch runs, safety off then on | ✅ ran; a hand stopped it correctly |
+| Area | What was checked | Result |
+|---|---|---|
+| **Studio safety API** | capture home, manual stop, Play refused while latched, acknowledge, events, stop frames, monitor on/off | ✅ all calls work on the real arm |
+| **Models by direct `curl`** | Pi0.5 `/info` + `/predict`, Qwen `/v1/chat/completions` on hand and clean frames | ✅ Pi0.5 returns a 50×6 chunk; Qwen 6/6 correct |
+| **Live runs, OpenVINO** | 11 runs on the arm, with the monitor on and off, including full sorts | ✅ cubes sorted; timings in section 4 |
+| **Live runs, PyTorch** | 3 runs on the arm: safety off, then on | ✅ ran; a hand stopped it correctly |
+| **Hand stops** | a hand in view while Pi0.5 drives | ✅ 4/4 stopped; the arm went home, and froze when the hand stayed |
+| **False stops** | stops with no hazard | ⚠️ 3 live (0.70–0.75 confidence), 1 near miss (0.559) |
+| **Scene prompt** | old vs new prompt on 101 dataset frame pairs + the 4 real hand stops | ✅ false stops 5 → 1, all hands still caught |
+| **New-session bug** | a newly opened session monitored nothing | ✅ fixed, with a unit test |
+| **openpi PR #1009** | `docs/xpu.md` steps 1–5 on the B70, with openpi's LIBERO demo | ✅ 126 ms client / 120 ms policy, as the guide expects |
+| **PyTorch export** | Pi0.5 `pi05.pt` served on XPU, called by Studio's own client | ✅ works, ~4.7× slower than OpenVINO |
+| **Same model check** | OpenVINO vs PyTorch with the same frames, state and noise | ✅ same model (section 4.3) |
+| **Remote server API + UI** | host/port per backend, Test connection, wrong-model warning, in a real browser | ✅ section 5 |
 
-New in this report:
+**One correct stop and one false stop**, as Qwen saw them:
 
-| # | Time (UTC) | Test | Result |
-|---|---|---|---|
-| 39 | 11-17 00:14:35 · 00:16:16 · 00:17:09 | **PyTorch on the arm**: one run with safety off, two with it on | ✅ 35 calls. 00:16:27: Qwen saw a hand (100%), the policy stopped, the arm went home, then froze 0.55 s later with the hand still there ([frame](2026-11-12-safety-api-tests/frames/pytorch-hand-topview.jpg)). Acknowledged at 00:17:04, the next run ran normally |
-| 40 | 11-17 00:30 | New UI driven in a real browser (Playwright, [ui_snap.mjs](2026-11-17-remote-inference-test-report/ui_snap.mjs)) | ✅ both servers "Connected, same model"; screenshots in section 5 |
+![A hand stop (top) and a false stop on an empty mat after a sort (bottom)](2026-11-17-remote-inference-test-report/safety-stops.jpg)
+
+- **Top, 11-17 00:16:27, PyTorch running:** Qwen saw the hand (100%). The policy stopped in 1 ms and
+  the arm went home, then froze 0.55 s later because the hand was still there.
+- **Bottom, 11-13 00:07:59:** the cube is already in the blue bin and the mat is empty, but Qwen said
+  `UNSAFE_OBJECT` at 0.70, probably because of the cubes inside the bin or the gripper's shadow.
 
 ## 4. Inference time and latency
 
@@ -151,18 +151,12 @@ Where a model is loaded (**Models → Run model**, or **Load model** in a sessio
 **Remote server** device. Choosing it shows the server's host and port, and **Test connection**
 saves them and asks the server what it runs.
 
-**The device list for PyTorch.** The remote server is listed beside the local GPU and CPU, and is
-never picked automatically:
+![1. Pick the remote server · 2. PyTorch on port 18767, same model · 3. OpenVINO on port 18765, same model](2026-11-17-remote-inference-test-report/remote-server-ui.png)
 
-![Inference device list with Remote server (172.18.0.1:18767)](2026-11-17-remote-inference-test-report/ui-1-device-list.png)
-
-**PyTorch, remote server tested.** Host `172.18.0.1`, port `18767`: connected, `torch on xpu`, same model:
-
-![PyTorch remote server connected, same model](2026-11-17-remote-inference-test-report/ui-2-pytorch-remote-tested.png)
-
-**OpenVINO, remote server tested.** Each backend keeps its own server (port `18765`):
-
-![OpenVINO remote server connected, same model](2026-11-17-remote-inference-test-report/ui-3-openvino-remote-tested.png)
+1. **Pick "Remote server"** in the device list. It is listed beside the local GPU and CPU, and is
+   never picked automatically.
+2. **PyTorch:** host `172.18.0.1`, port `18767`. Test connection: connected, `torch on xpu`, same model.
+3. **OpenVINO:** each backend keeps its own server, here port `18765`.
 
 What Test connection can show:
 
@@ -189,7 +183,7 @@ the OpenVINO port → `same_model: false`).
 | Bug | Effect | Fix |
 |---|---|---|
 | `safety.sh` status summary crashed (`\"` inside an f-string, inside bash single quotes) | No status after `capture-home`, though the call worked | Python moved into a quoted heredoc |
-| **A new session did not run the monitor** until some safety call | A hand did not stop Pi0.5 in a freshly opened session (test 21) | The session loads the arm's saved safety settings when the environment loads; unit test added |
+| **A new session did not run the monitor** until some safety call | A hand did not stop Pi0.5 in a freshly opened session | The session loads the arm's saved safety settings when the environment loads; unit test added |
 | UI: the test result vanished right after "Save and test" | The saved-server refresh reset the fields | Fields reset only on a backend change; filled only while empty |
 | UI: typing a port, then clicking the button at once, did nothing | The port field commits on blur, after the click had run | The button reads the latest typed values |
 

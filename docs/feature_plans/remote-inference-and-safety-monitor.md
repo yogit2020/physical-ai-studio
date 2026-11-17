@@ -7,7 +7,6 @@ Status: draft, 2026-11-12. Branch `feature/remote-inference-safety` (from `main`
 | **Branch** | [`yogit2020/physical-ai-studio` · `feature/remote-inference-safety`](https://github.com/yogit2020/physical-ai-studio/tree/feature/remote-inference-safety) |
 | **Open a PR** | [compare with `main`](https://github.com/yogit2020/physical-ai-studio/compare/main...feature/remote-inference-safety) (not opened yet) |
 | **Test report** | [`docs/reports/2026-11-17-remote-inference-test-report.md`](../reports/2026-11-17-remote-inference-test-report.md): summary of all tests, inference time and latency for Pi0.5 (OpenVINO and PyTorch) and Qwen, with safety on and off, and screenshots of the remote server UI |
-| **Tests done** | [`docs/reports/2026-11-12-safety-api-tests.md`](../reports/2026-11-12-safety-api-tests.md): 23 tests on the live SO-101 and offline. Studio safety API, direct `curl` calls to Pi0.5 and Qwen with timings, real hand stops, one false stop, a full sort, and the scene prompt comparison |
 | **Unit tests** | `application/backend/tests/runtime_session/test_safety.py`, `test_safety_monitor.py` (112 runtime-session tests pass) |
 | **Shell tool** | `application/backend/scripts/safety.sh` (status, stop, ack, home, monitor-on, events, frames) |
 
@@ -99,7 +98,7 @@ Two AI models run side by side on the B70. Studio talks to both over an SSH tunn
 | Inference time (on GPU) | **66–72 ms** | ~0.35 s prefill + 2–4 tokens |
 | Latency seen by Studio | **~100 ms** (mean 100, p50 92 ms, 49 live calls) | **~0.43 s** (429–503 ms) |
 
-Measured on 2026-11-12; see `docs/reports/2026-11-12-safety-api-tests.md`.
+Measured 2026-11-12 to 11-17; see `docs/reports/2026-11-17-remote-inference-test-report.md`.
 
 ### 3.2 Flow: what the AI decides, and what happens next
 
@@ -233,7 +232,7 @@ They are stored in `remote_inference.json` as `{"servers": {"openvino": {...}, "
 older one-server form (`{"url": ...}`) still works and is converted on the first save.
 
 Current B70 servers: OpenVINO `172.18.0.1:18765` (65 ms on the GPU), PyTorch `172.18.0.1:18767`
-(330 ms). Both are the same model (report test 36).
+(330 ms). Both are the same model (test report, section 4.3).
 
 ## 4. Components
 
@@ -295,8 +294,7 @@ Loop, at `check_hz` (default 2 Hz; each check is skipped if the previous one is 
    sees bins, logos and blocks very close and cut off at the edges. Live testing on 2026-11-12 found
    one more case: a cube held in the gripper fills the wrist image, and over a bin the wrist camera
    looks past the mat. Allowing the held cube, ignoring the off-mat view, and trusting the overhead
-   camera for objects cut false stops from 5 to 1 in 101 pairs, with all hands still caught (report
-   test 23). The prompt is per session (`prompt`) because it is specific to the cell. The current
+   camera for objects cut false stops from 5 to 1 in 101 pairs, with all hands still caught (test report, section 3). The prompt is per session (`prompt`) because it is specific to the cell. The current
    one is in `scripts/safety.sh`.
 4. Publish the verdict on the session bus (`evt/safety/verdict`).
 5. Decide (see 4.3) and, when it is a stop, request it from the session.
