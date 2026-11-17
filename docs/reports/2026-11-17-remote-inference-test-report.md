@@ -12,11 +12,11 @@ is in [remote-inference-and-safety-monitor.md](../feature_plans/remote-inference
 | | Result |
 |---|---|
 | **Pi0.5 on OpenVINO** (remote B70) | **72 ms** on the GPU, **95 ms** round trip, 152 live calls. The arm sorted cubes |
-| **Pi0.5 on PyTorch** (remote B70, new) | **341 ms** on the GPU, **~360 ms** round trip, 35 live calls. The arm ran with safety off and on |
+| **Pi0.5 on PyTorch** (remote B70, new) | **93 ms** on the GPU, **115 ms** round trip with `torch.compile` (was 341 / ~360 ms uncompiled; the arm ran with safety off and on) |
 | **Same model on both?** | **Yes.** With the same start noise the actions differ by 0.05–0.14 on average, against 0.82 between two normal samples |
-| **Qwen safety check** | **0.47 s** per check (new prompt), twice a second, on its own GPU. It never slows Pi0.5 down |
+| **Qwen safety check** | **0.47 s** per check (Qwen3.6, new prompt), twice a second, on its own GPU. It never slows Pi0.5 down. **Qwen3.8 AWQ** (0.55 s) removes the false stops: section 4.6 |
 | **Hand stops** | **4 of 4 correct** (OpenVINO ×3, PyTorch ×1). Each one stopped the policy in < 2 ms; the arm went home, and froze when the hand was still there |
-| **False stops** | 3, all `UNSAFE_OBJECT` around the bins. A new prompt cuts them from 5 to 1 in 101 test frames |
+| **False stops** | 3, all `UNSAFE_OBJECT` around the bins. A new prompt cuts them from 5 to 1 in 101 test frames; Qwen3.8 has **0**, and passes all 3 real false-stop frames |
 | **Bugs found and fixed** | 4: `safety.sh` crash, new sessions not monitoring, and 2 in the new UI |
 | **New UI** | Pick a remote server per backend by host and port, with **Test connection** (section 5) |
 
@@ -109,6 +109,23 @@ pause per chunk is longer.
 
 Server start-up: OpenVINO loads in 22 s, PyTorch in 99 s.
 
+### 4.2.1 PyTorch with `torch.compile` (2026-11-17)
+
+Studio's PyTorch runtime loads the model on the XPU in bfloat16 with gradients off, but leaves
+`torch.compile` off by default, and the model forces the slower "eager" attention. Turning compile
+on (`remote_policy_server.py --compile`, which passes `compile_model=True`; Pi0.5 then compiles with
+`mode="default"`):
+
+| PyTorch on the B70 | First call | Inference, later calls | Round trip from Studio |
+|---|---|---|---|
+| Uncompiled | 2.6 s | 373 ms (354–440) | ~360 ms |
+| **Compiled** | 177 s compile, done at server start by `--warmup` | **92.5 ms** (91–93) | **115 ms** (110–118) |
+| OpenVINO, for reference | 0.1–0.35 s | 65–70 ms | 91 ms |
+
+Compiled output against OpenVINO with the same noise: mean difference **0.047–0.098**, max 0.19–0.33
+(uncompiled: 0.05–0.14 / 0.21–0.51), so compiling does not change the actions. The server now takes
+~5 minutes to start (99 s load + 172 s warm-up), then answers its first request in ~115 ms.
+
 ### 4.3 Is the PyTorch model the same model?
 
 Same 3 dataset moments × 3 start noises into both. Differences in joint units over the whole 50×6 chunk:
@@ -135,6 +152,23 @@ in GPU precision.
 
 Each check sends two 448 px images and the scene prompt (~551 tokens) and gets back one word,
 `SAFE`, `UNSAFE_HAND` or `UNSAFE_OBJECT` (2–4 tokens). The new prompt is longer: +24 ms per check.
+
+### 4.6 Qwen3.8 AWQ instead of Qwen3.6 (2026-11-17)
+
+[`cyankiwi/Qwen3.8-27B-AWQ-INT4`](https://huggingface.co/cyankiwi/Qwen3.8-27B-AWQ-INT4): same
+architecture as Qwen3.6, 4-bit weights (W4A16, group 32), 21 GB. vLLM 0.32's Intel-GPU W4A16 kernel
+runs it. To fit beside the driver's baseline on one B70 it needs a smaller context (2,048 tokens, one
+request at a time); a check needs ~650. Same frames and scene prompt for both:
+
+| | Qwen3.6-27B INT4 (Intel AutoRound) | **Qwen3.8-27B AWQ INT4** |
+|---|---|---|
+| False stops, 101 normal dataset frame pairs | 1 | **0** |
+| The 3 real false stops from the arm | 2 of 3 still stop (0.70, 0.75) | **0 of 3**: all `SAFE` (0.80–0.87) |
+| Real hand stops caught | 5 of 5 | **5 of 5** (0.96–1.00) |
+| Time per check | 0.46–0.47 s | **0.55 s** (546–622 ms) |
+| GPU 0 memory | 24 GiB share, 4,096-token context | 24.2 GiB share, 2,048-token context, 19,114 tokens of KV cache |
+
+Qwen3.6's numbers for the two newest false stops and the newest hand are its live verdicts on the arm.
 
 ### 4.5 Stop timing
 
@@ -191,8 +225,8 @@ the OpenVINO port → `same_model: false`).
 
 | Issue | Next step |
 |---|---|
-| False `UNSAFE_OBJECT` stops near the bins and on an empty mat after a sort (0.70–0.75) | Allow "cubes inside a bin" and "the arm's shadow" in the prompt, or set `unsafe_consecutive: 2` (+0.5 s per real stop) |
-| PyTorch is ~4.7× slower than OpenVINO | Compile the PyTorch model (openpi's `max-autotune` reached 120 ms on its demo); expected 120–180 ms (estimate) |
+| False `UNSAFE_OBJECT` stops near the bins and on an empty mat after a sort (0.70–0.75) | Switch to **Qwen3.8 AWQ** (0 false stops offline, section 4.6), then confirm with full sorting episodes on the arm |
+| ~~PyTorch is ~4.7× slower than OpenVINO~~ | **Done:** `--compile` brings it to 93 ms on the GPU, 115 ms round trip (section 4.2) |
 | The OpenVINO export uses one fixed start noise for every chunk | Convert it to take noise as an input (`python -m physicalai.policies.pi05.noise_input`), then compare on the arm |
 | The SSH tunnels drop when the connection breaks | Restart them; port 18767 has its own tunnel |
 | Not tested yet | objects other than hands, the 2 s fail-safe (Qwen down or a frozen camera), stop latency against camera timestamps, more full episodes for a false-stop rate |

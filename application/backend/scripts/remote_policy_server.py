@@ -4,10 +4,16 @@ Run it inside the Studio image on the machine with the accelerator, bound to
 localhost, and reach it through an SSH tunnel::
 
     python remote_policy_server.py --export-dir /models/exports/openvino --backend openvino --device GPU
+    python remote_policy_server.py --export-dir /models/exports/torch --backend torch --device xpu \
+        --compile --warmup warmup_request.json
 
 ``GET /info`` names the loaded export and its weights fingerprint; ``POST /predict``
 takes ``{"state": [[...]], "images": {name: base64 JPEG}, "task": str | null}`` and
 returns ``{"action": [[...]], "infer_ms": float}``.
+
+``--compile`` runs a PyTorch export through ``torch.compile`` (Pi0.5 on a B70: 373 ms -> 93 ms per
+chunk). Its first call compiles for minutes, longer than a client waits, so give ``--warmup`` a
+``/predict`` request body to answer once before serving.
 """
 
 from __future__ import annotations
@@ -27,6 +33,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from workers.remote_predictor import decode_frame, weights_fingerprint
 
 
+def _observation(request: dict) -> dict:
+    """A ``/predict`` request body as the model's observation."""
+    observation = {"state": np.asarray(request["state"], dtype=np.float32)}
+    observation.update({name: decode_frame(image) for name, image in request["images"].items()})
+    if request.get("task"):
+        observation["task"] = [request["task"]]
+    return observation
+
+
 def main() -> None:
     """Load the export, then serve it until killed."""
     parser = argparse.ArgumentParser()
@@ -35,12 +50,18 @@ def main() -> None:
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18765)
+    parser.add_argument("--compile", action="store_true", help="torch.compile a PyTorch export")
+    parser.add_argument("--warmup", type=Path, help="a /predict request body (JSON) to answer once before serving")
     args = parser.parse_args()
+    if args.compile and args.backend != "torch":
+        parser.error("--compile is for --backend torch")
 
     from physicalai.inference import InferenceModel
 
     started = time.perf_counter()
-    model = InferenceModel(args.export_dir, backend=args.backend, device=args.device)
+    model = InferenceModel(
+        args.export_dir, backend=args.backend, device=args.device, **({"compile_model": True} if args.compile else {})
+    )
     info = {
         "host": socket.gethostname(),
         "export_dir": str(args.export_dir),
@@ -49,6 +70,12 @@ def main() -> None:
         "fingerprint": weights_fingerprint(args.export_dir),
     }
     print(f"loaded in {time.perf_counter() - started:.1f}s: {info}", flush=True)
+    if args.warmup is not None:
+        warm = time.perf_counter()
+        model.predict_action_chunk(_observation(json.loads(args.warmup.read_text())))
+        print(f"warmed up in {time.perf_counter() - warm:.1f}s", flush=True)
+    elif args.compile:
+        print("no --warmup: the first request compiles the model and will outlast the client's timeout", flush=True)
     # One inference at a time: a policy is not re-entrant, and a session has one request in flight.
     lock = threading.Lock()
 
@@ -69,11 +96,7 @@ def main() -> None:
                 self._send(404, {"error": "not found"})
                 return
             try:
-                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                observation = {"state": np.asarray(request["state"], dtype=np.float32)}
-                observation.update({name: decode_frame(image) for name, image in request["images"].items()})
-                if request.get("task"):
-                    observation["task"] = [request["task"]]
+                observation = _observation(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
                 with lock:
                     start = time.perf_counter()
                     action = model.predict_action_chunk(observation)
