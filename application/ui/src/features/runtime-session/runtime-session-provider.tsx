@@ -26,9 +26,13 @@ import {
     SchemaLoadModelCommand,
     SchemaObservationMessage,
     SchemaReloadEnvironmentCommand,
+    SchemaSafetyAcknowledgeCommand,
+    SchemaSafetyMessage,
+    SchemaSafetyStopCommand,
     SchemaSaveEpisodeCommand,
     SchemaSessionState,
     SchemaSetControlCommand,
+    SchemaSetSafetyCommand,
     SchemaStartEpisodeCommand,
     SchemaStateMessage,
     SchemaStatusMessage,
@@ -41,7 +45,13 @@ import { JointsState } from '../robots/use-robot-observations';
 /** Session errors go away by themselves; the parts panel keeps showing what is still failed. */
 export const ERROR_TOAST = { timeout: 10_000 };
 
-type JsonServerMessage = SchemaAckMessage | SchemaStateMessage | SchemaErrorMessage | SchemaStatusMessage;
+type JsonServerMessage =
+    | SchemaAckMessage
+    | SchemaStateMessage
+    | SchemaErrorMessage
+    | SchemaStatusMessage
+    // A safety event; the ``state`` that follows it carries the new latch state, so it needs no handling here.
+    | SchemaSafetyMessage;
 /** The last status of each part and device, by component: ``environment``, ``environment/cam 0``, ``control``. */
 export type Statuses = Record<string, SchemaStatusMessage>;
 type Command =
@@ -55,7 +65,10 @@ type Command =
     | Omit<SchemaUnloadModelCommand, 'request_id'>
     | Omit<SchemaStartEpisodeCommand, 'request_id'>
     | Omit<SchemaSaveEpisodeCommand, 'request_id'>
-    | Omit<SchemaDiscardEpisodeCommand, 'request_id'>;
+    | Omit<SchemaDiscardEpisodeCommand, 'request_id'>
+    | Omit<SchemaSafetyStopCommand, 'request_id'>
+    | Omit<SchemaSafetyAcknowledgeCommand, 'request_id'>
+    | Omit<SchemaSetSafetyCommand, 'request_id'>;
 
 /** A model export to load: which model, and the backend and device it runs on. */
 export type SessionModelToLoad = Omit<SchemaLoadModelCommand, 'request_id' | 'command'>;

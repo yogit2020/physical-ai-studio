@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 
-import { Button, Flex, Item, Picker, Slider, TextArea, toast } from '@geti-ui/ui';
+import { Button, Divider, Flex, Item, Picker, Slider, TextArea, toast } from '@geti-ui/ui';
 
 import { $api } from '../../../api/client';
 import { SchemaExecutionConfig, SchemaModelControlConfig } from '../../../api/openapi-spec';
 import { ERROR_TOAST, failureOf, useRuntimeSession } from '../runtime-session-provider';
+import { SafetyPanel } from './safety-panel';
 
 const EXECUTION_MODES: { key: SchemaExecutionConfig['mode']; label: string }[] = [
     { key: 'sync', label: 'Synchronous' },
@@ -115,6 +116,8 @@ export const InferenceMode = () => {
                     Play
                 </Button>
             )}
+            <Divider size='S' />
+            <SafetyPanel />
         </Flex>
     );
 };
