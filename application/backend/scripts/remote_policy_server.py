@@ -13,7 +13,8 @@ returns ``{"action": [[...]], "infer_ms": float}``.
 
 ``--compile`` runs a PyTorch export through ``torch.compile`` (Pi0.5 on a B70: 373 ms -> 93 ms per
 chunk). Its first call compiles for minutes, longer than a client waits, so give ``--warmup`` a
-``/predict`` request body to answer once before serving.
+``/predict`` request body to answer once before serving, or ``--warmup-synthetic`` to build one from
+the export's manifest (blank frames at each camera's size), which needs no recorded frame.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from workers.remote_predictor import decode_frame, weights_fingerprint
+from workers.remote_predictor import decode_frame, encode_frame, weights_fingerprint
 
 
 def _observation(request: dict) -> dict:
@@ -40,6 +41,21 @@ def _observation(request: dict) -> dict:
     if request.get("task"):
         observation["task"] = [request["task"]]
     return observation
+
+
+def _synthetic_request(export_dir: Path, task: str) -> dict:
+    """A ``/predict`` request body shaped like the export's inputs: zero state, mid-grey frames."""
+    features = [
+        f["init_args"] for f in json.loads((export_dir / "manifest.json").read_text())["model"]["input_features"]
+    ]
+    request: dict = {"images": {}, "task": task}
+    for feature in features:
+        if feature["ftype"] == "STATE":
+            request["state"] = np.zeros((1, *feature["shape"]), dtype=np.float32).tolist()
+        elif feature["ftype"] == "VISUAL":
+            _, height, width = feature["shape"]
+            request["images"][feature["name"]] = encode_frame(np.full((1, height, width, 3), 128, np.uint8))
+    return request
 
 
 def main() -> None:
@@ -52,9 +68,19 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--compile", action="store_true", help="torch.compile a PyTorch export")
     parser.add_argument("--warmup", type=Path, help="a /predict request body (JSON) to answer once before serving")
+    parser.add_argument(
+        "--warmup-synthetic",
+        action="store_true",
+        help="warm up with a request built from the export's manifest instead of --warmup",
+    )
+    parser.add_argument(
+        "--warmup-task", default="Sort this item into the correct bin", help="task for --warmup-synthetic"
+    )
     args = parser.parse_args()
     if args.compile and args.backend != "torch":
         parser.error("--compile is for --backend torch")
+    if args.warmup is not None and args.warmup_synthetic:
+        parser.error("use --warmup or --warmup-synthetic, not both")
 
     from physicalai.inference import InferenceModel
 
@@ -70,9 +96,14 @@ def main() -> None:
         "fingerprint": weights_fingerprint(args.export_dir),
     }
     print(f"loaded in {time.perf_counter() - started:.1f}s: {info}", flush=True)
-    if args.warmup is not None:
+    if args.warmup is not None or args.warmup_synthetic:
         warm = time.perf_counter()
-        model.predict_action_chunk(_observation(json.loads(args.warmup.read_text())))
+        request = (
+            _synthetic_request(args.export_dir, args.warmup_task)
+            if args.warmup_synthetic
+            else json.loads(args.warmup.read_text())
+        )
+        model.predict_action_chunk(_observation(request))
         print(f"warmed up in {time.perf_counter() - warm:.1f}s", flush=True)
     elif args.compile:
         print("no --warmup: the first request compiles the model and will outlast the client's timeout", flush=True)
