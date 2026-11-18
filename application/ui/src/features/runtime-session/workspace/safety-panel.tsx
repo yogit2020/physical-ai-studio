@@ -144,7 +144,7 @@ export const SafetyPanel = () => {
                         'stop',
                         {
                             command: 'safety_stop',
-                            reason: 'Emergency stop from the UI',
+                            reason: 'Safety stop from the UI',
                             source: 'ui',
                             hazard: 'other',
                             hold: false,
@@ -153,7 +153,7 @@ export const SafetyPanel = () => {
                     )
                 }
             >
-                Emergency stop
+                Safety stop
             </Button>
         </Flex>
     );

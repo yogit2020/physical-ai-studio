@@ -140,7 +140,7 @@ describe('SafetyPanel', () => {
         );
 
         render(<SafetyPanel />);
-        fireEvent.click(screen.getByRole('button', { name: 'Emergency stop' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Safety stop' }));
 
         await waitFor(() => expect(notify).toHaveBeenCalledWith('Load an environment first.', { timeout: 10_000 }));
         expect(session.send).toHaveBeenCalledWith(
