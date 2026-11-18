@@ -137,7 +137,9 @@ class PiGemmaRMSNorm(nn.Module):
         if cond.shape[-1] != self.cond_dim:
             msg = f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}"
             raise ValueError(msg)
-        modulation = self.dense(cond)
+        # cond arrives as float32 on the inference path; dense.weight is bfloat16 when
+        # the model runs fully in bf16.
+        modulation = self.dense(cond.to(self.dense.weight.dtype))
         if len(x.shape) == 3:  # noqa: PLR2004
             modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)
