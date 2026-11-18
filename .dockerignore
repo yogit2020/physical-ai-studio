@@ -36,6 +36,8 @@
 !application/backend/src/
 application/backend/src/static/robot-assets
 !application/backend/scripts/hatch_build.py
+# The remote policy server, run from this image by deploy/docker/Dockerfile.pi05-policy-server.
+!application/backend/scripts/remote_policy_server.py
 
 
 # ---- Application: Docker ----

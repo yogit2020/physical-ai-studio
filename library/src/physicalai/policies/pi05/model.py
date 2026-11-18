@@ -382,13 +382,17 @@ class PaliGemmaWithExpertModel(nn.Module):
             msg = f"Invalid precision: {precision}"
             raise ValueError(msg)
 
-        params_to_keep_float32 = [
-            "vision_tower",
-            "multi_modal_projector",
-            "input_layernorm",
-            "post_attention_layernorm",
-            "model.norm",
-        ]
+        params_to_keep_float32 = (
+            []
+            if precision == "bfloat16"
+            else [
+                "vision_tower",
+                "multi_modal_projector",
+                "input_layernorm",
+                "post_attention_layernorm",
+                "model.norm",
+            ]
+        )
 
         for name, param in self.named_parameters():
             if any(selector in name for selector in params_to_keep_float32):
@@ -902,7 +906,10 @@ class Pi05Model(PeftModelMixin, SnapFlowModelMixin, RTCModelMixin, Model):
         pad_masks.append(masks)
         att_masks += [0] * lang_emb.shape[1]
 
-        embs_cat = torch.cat(embs, dim=1)
+        # embed_image() returns features in the input image dtype (float32 at inference)
+        # while the language embedding emits the model dtype; with bf16 weights the
+        # concatenation would mix dtypes. Normalise on the language embedding's dtype.
+        embs_cat = torch.cat([emb.to(lang_emb.dtype) for emb in embs], dim=1)
         pad_masks_cat = torch.cat(pad_masks, dim=1)
         att_masks_t = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks_cat.device)
         att_masks_t = att_masks_t[None, :].expand(bsize, len(att_masks))
@@ -934,11 +941,12 @@ class Pi05Model(PeftModelMixin, SnapFlowModelMixin, RTCModelMixin, Model):
         time_emb = time_emb.type(dtype=timestep.dtype)
 
         def action_proj_func(noisy_actions: Tensor) -> Tensor:
-            return self.action_in_proj(noisy_actions)
+            return self.action_in_proj(noisy_actions.to(self.action_in_proj.weight.dtype))
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         def time_mlp_func(time_emb: Tensor) -> Tensor:
+            time_emb = time_emb.to(self.time_mlp_in.weight.dtype)
             x = self.time_mlp_in(time_emb)
             x = F.silu(x)
             x = self.time_mlp_out(x)
@@ -956,6 +964,7 @@ class Pi05Model(PeftModelMixin, SnapFlowModelMixin, RTCModelMixin, Model):
             target_time_emb = target_time_emb.type(dtype=timestep.dtype)
 
             def target_time_mlp_func(emb: Tensor) -> Tensor:
+                emb = emb.to(self.target_time_mlp_in.weight.dtype)
                 x = self.target_time_mlp_in(emb)
                 x = F.silu(x)
                 return self.target_time_mlp_out(x)
@@ -1044,7 +1053,7 @@ class Pi05Model(PeftModelMixin, SnapFlowModelMixin, RTCModelMixin, Model):
             )
 
         suffix_out = suffix_out[:, -self._chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
 
         def action_out_proj_func(suffix_out: Tensor) -> Tensor:
             return self.action_out_proj(suffix_out)
@@ -1378,5 +1387,5 @@ class Pi05Model(PeftModelMixin, SnapFlowModelMixin, RTCModelMixin, Model):
 
         suffix_out = outputs_embeds[1]  # type: ignore[index]
         suffix_out = suffix_out[:, -self._chunk_size :]  # type: ignore[index]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         return self.action_out_proj(suffix_out)

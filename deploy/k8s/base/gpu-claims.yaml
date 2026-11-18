@@ -1,0 +1,29 @@
+# One Intel GPU per model server, allocated by the Intel GPU DRA driver
+# (https://github.com/intel/intel-resource-drivers-for-kubernetes, DeviceClass gpu.intel.com).
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: qwen-gpu
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          exactly:
+            deviceClassName: gpu.intel.com
+            allocationMode: ExactCount
+            count: 1
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: pi05-gpu
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          exactly:
+            deviceClassName: gpu.intel.com
+            allocationMode: ExactCount
+            count: 1

@@ -271,3 +271,70 @@ def test_recording_commands_over_the_socket(client: TestClient) -> None:
         swapped = socket.ack({"command": "load_environment", "environment": no_cameras, "unload_incompatible": True})
         assert swapped["ok"]
         assert socket.until_state(lambda data: data["dataset"] is None)["environment"]["cameras"] == []
+
+
+# Safety: the REST routes and socket commands of the session's safety latch.
+
+
+@pytest.fixture
+def own_storage(tmp_path, monkeypatch) -> None:
+    """Home poses are kept per follower, and every test's follower has the same id."""
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+
+
+def _open_safety(client: TestClient, websocket, registry) -> tuple[_Socket, str]:
+    websocket.receive_json()
+    socket = _Socket(websocket)
+    assert socket.ack({"command": "load_environment", "environment": _draft()})["ok"]
+    socket.until_state(lambda data: data["environment"] is not None)
+    (session,) = registry.sessions()
+    return socket, f"/api/runtime/sessions/{session.id}/safety"
+
+
+def test_an_external_stop_latches_and_reaches_the_socket(client: TestClient, registry, own_storage) -> None:
+    with client.websocket_connect(_url()) as websocket:
+        socket, safety = _open_safety(client, websocket, registry)
+
+        stopped = client.post(f"{safety}/stop", json={"reason": "light curtain", "source": "plc", "hazard": "other"})
+
+        assert stopped.status_code == 200
+        assert stopped.json()["state"] == "latched"
+        assert stopped.json()["latched_by"]["motion"] == "hold"  # no home pose captured yet
+        event = socket.receive_until(lambda message: message["type"] == "safety")
+        assert (event["data"]["kind"], event["data"]["source"]) == ("stop", "plc")
+        assert socket.until_state(lambda data: data["safety"]["state"] == "latched")
+
+        refused = socket.ack({"command": "set_control", "control": {"type": "model"}})
+        assert refused["error"]["error_code"] == "safety_latched"
+
+        assert client.get(safety).json()["counters"] == {"stop": 1}
+        assert [e["kind"] for e in client.get(f"{safety}/events").json()] == ["stop"]
+        assert client.post(f"{safety}/acknowledge", params={"source": "operator"}).json()["state"] == "clear"
+
+
+def test_home_pose_over_rest_and_stop_over_the_socket(client: TestClient, registry, own_storage) -> None:
+    with client.websocket_connect(_url()) as websocket:
+        socket, safety = _open_safety(client, websocket, registry)
+        socket.until_state(lambda data: True)
+
+        assert client.put(safety, json={"home_pose": [1.0, 2.0, 3.0]}).status_code == 400  # 2 joints
+        captured = client.post(f"{safety}/home/capture")
+        assert captured.status_code == 200 and captured.json()["home_pose_set"]
+        assert client.put(safety, json={**captured.json()["config"], "home_duration_s": 0.3}).status_code == 200
+        assert client.post(f"{safety}/home/go").json()["state"] == "homing"
+
+        ack = socket.ack({"command": "safety_stop", "reason": "hand", "source": "gui", "hazard": "hand_or_person"})
+        assert ack["ok"]
+        assert socket.until_state(lambda data: data["safety"]["latched_by"] is not None)
+        assert socket.ack({"command": "safety_acknowledge"})["ok"]
+        assert socket.until_state(lambda data: data["safety"]["latched_by"] is None)
+
+
+def test_a_stop_needs_a_session_with_an_environment(client: TestClient, registry) -> None:
+    assert client.get("/api/runtime/sessions/nope/safety").status_code == 404
+    assert client.post("/api/runtime/sessions/nope/safety/stop", json={"reason": "x"}).status_code == 404
+    with client.websocket_connect(_url()) as websocket:
+        websocket.receive_json()
+        (session,) = registry.sessions()
+        refused = client.post(f"/api/runtime/sessions/{session.id}/safety/stop", json={"reason": "x"})
+        assert refused.status_code == 409

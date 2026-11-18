@@ -1,0 +1,8 @@
+{
+  "name": "Intel GPU policy server (Kubernetes)",
+  "memory": 34242297856,
+  "timing_log": "/app/storage/remote_inference_timing.csv",
+  "servers": {
+    "torch": {"host": "pi05-policy", "port": 18767}
+  }
+}

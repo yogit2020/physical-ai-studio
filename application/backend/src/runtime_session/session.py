@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import uuid4
 
 import anyio
+import numpy as np
 from loguru import logger
 
 from exceptions import BaseException as AppBaseException
@@ -46,12 +47,16 @@ from runtime_session.environment import COMPONENT as ENVIRONMENT
 from runtime_session.environment import RELOAD, Environment, describe_environment
 from runtime_session.model import COMPONENT as MODEL
 from runtime_session.model import ProcessModel, model_inputs
+from runtime_session.safety import SafetyLatch
+from runtime_session.safety_monitor import Hooks, SafetyMonitor
 from runtime_session.slot import Slot
 from runtime_session.store import ACTION, STATE, FeatureSpecMismatchError, Store
 from schemas.runtime_session import (
+    CaptureHomeCommand,
     CommandDone,
     DiscardEpisodeCommand,
     ErrorMessage,
+    GoHomeCommand,
     LoadDatasetCommand,
     LoadEnvironmentCommand,
     LoadModelCommand,
@@ -59,9 +64,14 @@ from schemas.runtime_session import (
     ReloadEnvironment,
     ReloadEnvironmentCommand,
     RuntimeSessionInfo,
+    SafetyAcknowledgeCommand,
+    SafetyMessage,
+    SafetyStopCommand,
+    SafetyStopRequest,
     SessionEnvironment,
     SessionState,
     SetControlCommand,
+    SetSafetyCommand,
     StateMessage,
     StatusMessage,
     UnloadDatasetCommand,
@@ -69,6 +79,7 @@ from schemas.runtime_session import (
     UnloadModelCommand,
 )
 from services.camera_claims import CameraClaim, settings_from_camera
+from settings import get_settings
 from workers import dataset_worker as dataset_rpc
 from workers.base import WorkerStartupError
 from workers.dataset_worker import RecordingStatus
@@ -89,7 +100,7 @@ if TYPE_CHECKING:
     from schemas.dataset import Dataset
     from schemas.environment import EnvironmentWithRelations
     from schemas.model import Model
-    from schemas.runtime_session import ControlConfig, EnvironmentDraft
+    from schemas.runtime_session import ControlConfig, EnvironmentDraft, SafetyConfig, SafetyEvent, SafetyStatus
     from services.camera_claims import CameraClaimRegistry
     from workers.base import ThreadWorker
 
@@ -158,12 +169,33 @@ class RuntimeSession:
         environment while the spec stays the same, so the dataset recording from it stays loaded."""
         self._bus: Bus | None = None
         """Hosted for the session's lifetime; its parts join it."""
+        safety_dir = get_settings().storage_dir / "safety"
+        self._safety = SafetyLatch(safety_dir)
+        """Outlives a reloaded environment: a hazard stop stays latched until a person acknowledges it."""
+        self._arrival: asyncio.Task[None] | None = None
+        """Reports the end of a move home."""
+        self._monitor = SafetyMonitor(
+            Hooks(
+                config=lambda: self._safety.config.monitor,
+                store=lambda: self._store if self._environment.value is not None else None,
+                guarding=self._guarded,
+                homing=lambda: self._safety.homing,
+                stop=self._monitor_stop,
+                report=self._on_monitor_event,
+            ),
+            frames_dir=safety_dir / "frames",
+        )
+        self._monitoring: asyncio.Task[None] | None = None
+        self._monitor_seen: tuple[str, bool] = ("off", False)
+        """The monitor's health and guarding as last put in the session's state."""
+        self._verdict_published = 0.0
 
     async def __aenter__(self) -> Self:
         self._bus = Bus.host(self.id)
         self._serve_commands(self._bus)
         self._listen(self._bus)
         self._registry.add(self)
+        self._monitoring = asyncio.create_task(self._monitor.run(), name=f"SafetyMonitor-{self.id}")
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -187,6 +219,9 @@ class RuntimeSession:
                     await self._environment.unload()
                     self._drop_store()
             finally:
+                self._end_move_home()
+                if self._monitoring is not None:
+                    self._monitoring.cancel()
                 self._registry.remove(self)
                 if notify:
                     self._emit(
@@ -204,7 +239,7 @@ class RuntimeSession:
 
     def _serve_commands(self, bus: Bus) -> None:
         """Serve the commands that change what the session holds; workers serve their own."""
-        commands: dict[str, tuple[type[BaseModel], Callable[[Any], Awaitable[None]]]] = {
+        commands: dict[str, tuple[type[BaseModel], Callable[[Any], Awaitable[object]]]] = {
             "load_environment": (
                 LoadEnvironmentCommand,
                 lambda command: self._load_draft(command.environment, unload_incompatible=command.unload_incompatible),
@@ -219,6 +254,11 @@ class RuntimeSession:
             "unload_dataset": (UnloadDatasetCommand, lambda _command: self.unload_dataset()),
             "load_model": (LoadModelCommand, self._load_model_command),
             "unload_model": (UnloadModelCommand, lambda _command: self.unload_model()),
+            "safety_stop": (SafetyStopCommand, self.safety_stop),
+            "safety_acknowledge": (SafetyAcknowledgeCommand, lambda command: self.safety_acknowledge(command.source)),
+            "set_safety": (SetSafetyCommand, lambda command: self.set_safety(command.config, source="gui")),
+            "capture_home": (CaptureHomeCommand, lambda _command: self.capture_home(source="gui")),
+            "go_home": (GoHomeCommand, lambda _command: self.go_home(source="gui")),
         }
         for name, (model, run) in commands.items():
             bus.serve(command_key(name), model, _as_command(name, run))
@@ -279,6 +319,7 @@ class RuntimeSession:
             control=control.config if control else None,
             dataset=dataset.state() if dataset else None,
             model=model.state() if model else None,
+            safety=self._safety.summary(self._monitor.state),
         )
 
     def info(self) -> RuntimeSessionInfo:
@@ -344,6 +385,9 @@ class RuntimeSession:
                 self._store = Store.create(description.spec, self.id)
             try:
                 await self._environment.load(self._loaded_environment(environment, description))
+                # The monitor reads the follower's saved config; without this a new session watches
+                # nothing until some safety call happens to load it.
+                self._use_follower_safety()
                 logger.info("Session {} loaded environment {!r}", self.id, environment.name)
             finally:
                 # Also when the load was refused: the dataset records from the store, which is there either way.
@@ -448,12 +492,20 @@ class RuntimeSession:
         """Stop the running control, hold the follower where it is, then start ``config``.
 
         Raises:
-            RuntimeSessionCommandError: No environment is loaded.
+            RuntimeSessionCommandError: No environment is loaded, or a hazard stop latched this kind of control.
             ValueError: The environment cannot run ``config`` (no leader, or no model loaded).
             WorkerStartupError: The control failed to start; the follower holds.
         """
         async with self._lock:
             loaded = self._environment.require("Load an environment first.")
+            if config is not None and self._safety.blocks(config):
+                cause = self._safety.latched_by
+                reason = f": {cause.reason}" if cause and cause.reason else ""
+                raise RuntimeSessionCommandError(
+                    f"A safety stop is latched{reason}. Acknowledge it before starting {config.type} control.",
+                    error_code="safety_latched",
+                )
+            self._end_move_home()
             try:
                 await self._switch_control(loaded.environment, config)
             finally:
@@ -604,6 +656,186 @@ class RuntimeSession:
         await worker.wait_stopped()
         publish_status(self.bus, component, "failed", worker.failure or "stopped unexpectedly")
 
+    # Safety: stopping for a hazard, moving home, and the latch. See runtime_session/safety.py.
+
+    def safety_status(self) -> SafetyStatus:
+        self._use_follower_safety()
+        return self._safety.status(self.id, self._monitor.state)
+
+    def safety_frame(self, event_id: str, camera: str) -> Path | None:
+        """A JPEG the monitor saved with a stop, or ``None``."""
+        return self._monitor.frame_path(event_id, camera)
+
+    def safety_events(self, *, limit: int = 100, stops_only: bool = False) -> list[SafetyEvent]:
+        return self._safety.events(limit=limit, stops_only=stops_only)
+
+    async def safety_stop(self, request: SafetyStopRequest, frames: dict[str, bytes] | None = None) -> SafetyStatus:
+        """End the running control if it is one a stop ends, move the follower home or hold it, and latch.
+
+        Latches even with nothing running, so a hazard reported while idle still blocks a start.
+
+        Raises:
+            RuntimeSessionCommandError: No environment is loaded.
+        """
+        async with self._lock:
+            loaded = self._environment.require("Load an environment first.")
+            self._use_follower_safety()
+            control = self._control.value
+            ends = control is not None and control.config.type in self._safety.config.stop_controls
+            stopped = control.config.type if control is not None and ends else None
+            if stopped is not None:
+                await self._switch_control(loaded.environment, None)
+            if control is not None and stopped is None:
+                motion, homing_s = "none", None  # another control drives the follower; moving it would fight it
+            else:
+                motion, homing_s = self._stop_motion(loaded.environment.store, hold=request.hold)
+            event = self._safety.latch(request, stopped_control=stopped, motion=motion, homing_s=homing_s)
+            if frames:
+                event.frames = await asyncio.to_thread(self._monitor.save_frames, event.id, frames)
+            logger.warning(
+                "Session {} safety stop from {} ({}): {}; {} control stopped, follower {}",
+                self.id, request.source, request.hazard, request.reason, stopped or "no", motion,
+            )  # fmt: skip
+        self._announce(event, homing_s)
+        return self.safety_status()
+
+    async def safety_acknowledge(self, source: str = "api") -> SafetyStatus:
+        """A person clears the latch. Nothing restarts; a move home in progress finishes."""
+        async with self._lock:
+            event = self._safety.acknowledge(source=source)
+        if event is not None:
+            logger.info("Session {} safety latch acknowledged by {}", self.id, source)
+            self._announce(event, None)
+        return self.safety_status()
+
+    async def set_safety(self, config: SafetyConfig, *, source: str = "api") -> SafetyStatus:
+        """Raises: ValueError: ``home_pose`` does not fit the follower."""
+        async with self._lock:
+            self._use_follower_safety()
+            if config.home_pose is not None:
+                self._check_pose(config.home_pose)
+            event = self._safety.configure(config, source=source)
+        self._announce(event, None)
+        return self.safety_status()
+
+    async def capture_home(self, *, source: str = "api") -> SafetyStatus:
+        """Take where the follower is now as its home pose, kept for this follower.
+
+        Raises:
+            RuntimeSessionCommandError: No environment is loaded, or the follower has not been measured.
+        """
+        async with self._lock:
+            loaded = self._environment.require("Load an environment first.")
+            self._use_follower_safety()
+            state = loaded.environment.store.read(STATE)
+            if state is None:
+                raise RuntimeSessionCommandError("The follower has not been measured yet.")
+            event = self._safety.capture_home([float(value) for value in state.value], source=source)
+        self._announce(event, None)
+        return self.safety_status()
+
+    async def go_home(self, *, source: str = "api") -> SafetyStatus:
+        """Move the follower home now. Latches nothing.
+
+        Raises:
+            RuntimeSessionCommandError: No environment or no home pose, or a control drives the follower.
+        """
+        async with self._lock:
+            loaded = self._environment.require("Load an environment first.")
+            self._use_follower_safety()
+            if self._control.value is not None:
+                raise RuntimeSessionCommandError("Stop the control driving the follower first.")
+            if self._safety.config.home_pose is None:
+                raise RuntimeSessionCommandError("No home pose is set; capture one first.")
+            homing_s = self._move_home(loaded.environment.store)
+            if homing_s is None:
+                raise RuntimeSessionCommandError("The follower has not been measured yet.")
+            event = self._safety.moving_home(homing_s, source=source)
+        self._announce(event, homing_s)
+        return self.safety_status()
+
+    def _guarded(self) -> bool:
+        """Whether the monitor would stop something now: a control a stop ends drives, or a move home."""
+        control = self._control.value
+        return self._safety.homing or (control is not None and control.config.type in self._safety.config.stop_controls)
+
+    async def _monitor_stop(self, request: SafetyStopRequest, frames: dict[str, bytes]) -> None:
+        try:
+            await self.safety_stop(request, frames)
+        except Exception:  # the environment went away meanwhile; nothing is driving it then
+            logger.exception("Session {} could not make the safety monitor's stop", self.id)
+
+    def _on_monitor_event(self, event: SafetyEvent) -> None:
+        """Verdicts go to the socket at most twice a second; faults are kept with the other events."""
+        if event.kind == "monitor_fault":
+            self._safety.keep(event)
+        now = time.monotonic()
+        if event.kind != "verdict" or event.answer != "SAFE" or now - self._verdict_published >= 0.5:
+            self._verdict_published = now
+            if self._bus is not None:
+                self._bus.publish(EVENTS, SafetyMessage(data=event))
+        seen = (self._monitor.state.health, self._monitor.state.guarding)
+        if seen != self._monitor_seen:
+            self._monitor_seen = seen
+            self._emit(StateMessage(data=self.state()))
+
+    def _use_follower_safety(self) -> None:
+        if (loaded := self._environment.value) is not None:
+            self._safety.use_robot(loaded.state.robot_id)
+
+    def _check_pose(self, pose: list[float]) -> None:
+        if (loaded := self._environment.value) is not None and len(pose) != len(loaded.state.joint_names):
+            raise ValueError(f"The home pose has {len(pose)} joints, the follower has {len(loaded.state.joint_names)}")
+
+    def _stop_motion(self, store: Store, *, hold: bool) -> tuple[str, float | None]:
+        """Hold the lock, with no control running. Send the follower home, or hold it where it is."""
+        config = self._safety.config
+        if not hold and config.on_stop == "home" and config.home_pose is not None:
+            homing_s = self._move_home(store)
+            if homing_s is not None:
+                return "home", homing_s
+        self._end_move_home()
+        if (state := store.read(STATE)) is not None:
+            # Stamped now: the robot worker sends it at once, which also stops a move home partway.
+            store.write(ACTION, state.value, timestamp=time.monotonic())
+        return "hold", None
+
+    def _move_home(self, store: Store) -> float | None:
+        """Stamp the home pose due far enough ahead to keep every joint under ``max_joint_speed``.
+
+        The robot worker approaches a future-stamped action linearly, so the follower glides home.
+        ``None`` when the follower has not been measured, or the pose does not fit it.
+        """
+        config = self._safety.config
+        state = store.read(STATE)
+        if state is None or config.home_pose is None or len(config.home_pose) != len(state.value):
+            return None
+        home = np.asarray(config.home_pose, dtype=np.float64)
+        distance = float(np.max(np.abs(home - state.value))) if len(home) else 0.0
+        homing_s = max(config.home_duration_s, distance / config.max_joint_speed)
+        self._end_move_home()
+        store.write(ACTION, home, timestamp=time.monotonic() + homing_s)
+        return homing_s
+
+    def _end_move_home(self) -> None:
+        self._safety.stopped_moving()
+        if self._arrival is not None:
+            self._arrival.cancel()
+            self._arrival = None
+
+    def _announce(self, event: SafetyEvent, homing_s: float | None) -> None:
+        if self._bus is not None:
+            self._bus.publish(EVENTS, SafetyMessage(data=event))
+        self._emit(StateMessage(data=self.state()))
+        if homing_s is not None:
+            self._arrival = asyncio.create_task(self._report_arrival(homing_s))
+
+    async def _report_arrival(self, homing_s: float) -> None:
+        await asyncio.sleep(homing_s)
+        self._safety.stopped_moving()
+        self._arrival = None
+        self._emit(StateMessage(data=self.state()))
+
     # What the session does when its parts report; each part says why on the bus itself.
 
     async def _on_environment(self, status: StatusMessage) -> None:
@@ -656,7 +888,7 @@ def _model_mismatch(model: ProcessModel, spec: FeatureSpec) -> str | None:
     return None
 
 
-def _as_command(name: str, run: Callable[[Any], Awaitable[None]]) -> Callable[[Any], Awaitable[CommandDone]]:
+def _as_command(name: str, run: Callable[[Any], Awaitable[object]]) -> Callable[[Any], Awaitable[CommandDone]]:
     """A bus handler for a session command, failing with an error code its requester can show."""
 
     async def handle(command: Any) -> CommandDone:

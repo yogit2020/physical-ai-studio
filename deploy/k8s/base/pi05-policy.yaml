@@ -1,0 +1,94 @@
+# Pi0.5 policy server (PyTorch export, torch.compile) at http://pi05-policy:18767 (GET /info, POST /predict).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pi05-models
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pi05-policy
+  labels: {app.kubernetes.io/name: pi05-policy, app.kubernetes.io/part-of: physical-ai-studio}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: pi05-policy}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: pi05-policy, app.kubernetes.io/part-of: physical-ai-studio}
+    spec:
+      securityContext:
+        # Host GID that owns /dev/dri/renderD* (getent group render); the image runs as uid 1000.
+        supplementalGroups: [990]
+        fsGroup: 1000
+      resourceClaims:
+        - name: gpu
+          resourceClaimTemplateName: pi05-gpu
+      initContainers:
+        - name: fetch-model
+          image: pi05-policy-server
+          command: [python, -c]
+          args:
+            - |
+              import os, pathlib
+              from huggingface_hub import snapshot_download
+              token = os.environ.get("HF_TOKEN") or None
+              export = pathlib.Path("/models/pi05/exports/torch")
+              if (export / "manifest.json").is_file():
+                  print(f"{export} present, skipping download")
+              else:
+                  snapshot_download(os.environ["MODEL_REPO"], local_dir="/models/pi05", allow_patterns=["exports/torch/*"], token=token)
+              # The torch export has no tokenizer: Pi0.5 loads PaliGemma's (a gated repo, needs HF_TOKEN).
+              snapshot_download("google/paligemma-3b-pt-224", cache_dir=os.environ["HF_HUB_CACHE"], token=token,
+                                allow_patterns=["tokenizer*", "special_tokens_map.json", "added_tokens.json", "config.json"])
+          env:
+            - {name: MODEL_REPO, value: muniker/pi05-so101-sort-210base-65ft}
+            - {name: HF_HUB_CACHE, value: /models/hf-cache}
+            - {name: HF_HUB_OFFLINE, value: "0"}
+            - name: HF_TOKEN
+              valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+      containers:
+        - name: server
+          image: pi05-policy-server
+          # The image's CMD serves /models/pi05/exports/torch on xpu with --compile --warmup-synthetic.
+          env:
+            - {name: HF_HUB_CACHE, value: /models/hf-cache}
+          ports:
+            - {name: http, containerPort: 18767}
+          resources:
+            claims:
+              - name: gpu
+            requests: {cpu: "4", memory: 24Gi}
+          startupProbe:  # load (~100 s) + compile warm-up (~3 min); the port opens only when ready
+            httpGet: {path: /info, port: http}
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /info, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /info, port: http}
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: pi05-models}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pi05-policy
+spec:
+  selector: {app.kubernetes.io/name: pi05-policy}
+  ports:
+    - {name: http, port: 18767, targetPort: http}

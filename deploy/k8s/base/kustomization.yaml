@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: physical-ai-studio
+labels:
+  - pairs: {app.kubernetes.io/part-of: physical-ai-studio}
+    includeSelectors: false
+resources:
+  - namespace.yaml
+  - gpu-claims.yaml
+  - qwen-safety.yaml
+  - pi05-policy.yaml
+  - studio.yaml
+configMapGenerator:
+  - name: studio-remote-inference
+    files: [remote_inference.json]
+  - name: studio-safety  # the work cell's description for the safety monitor: edit for your scene
+    files: [scene-prompt.txt=safety-scene-prompt.txt]
+images:
+  - name: physical-ai-studio
+    newName: ghcr.io/yogit2020/physical-ai-studio-xpu
+    newTag: "18d8c6ec"
+  - name: pi05-policy-server
+    newName: ghcr.io/yogit2020/pi05-policy-server-xpu
+    newTag: "18d8c6ec"
+  - name: qwen-safety
+    newName: ghcr.io/yogit2020/qwen-safety-xpu
+    newTag: vllm-v0.32.0

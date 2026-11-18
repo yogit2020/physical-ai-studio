@@ -47,3 +47,20 @@ async def test_get_video_recording_presets_uses_system_service() -> None:
     service.get_video_recording_presets.return_value = expected
 
     assert await get_video_recording_presets(service) is expected
+
+
+def test_remote_inference_servers_are_set_and_checked_per_backend(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "storage_dir", tmp_path)
+    with TestClient(app) as client:
+        assert client.get("/api/system/remote-inference").json() == {"servers": {}}
+
+        response = client.put("/api/system/remote-inference/torch", json={"host": "172.18.0.1", "port": 18767})
+        assert response.status_code == 200
+        assert response.json() == {"servers": {"torch": {"host": "172.18.0.1", "port": 18767}}}
+
+        for bad in ({"host": "http://x", "port": 1}, {"host": "x", "port": 70000}, {"host": "", "port": 1}):
+            assert client.put("/api/system/remote-inference/torch", json=bad).status_code == 400
+        assert client.put("/api/system/remote-inference/onnx", json={"host": "x", "port": 1}).status_code == 400
+
+        check = client.post("/api/system/remote-inference/check", json={"host": "127.0.0.1", "port": 1}).json()
+        assert check["ok"] is False and check["url"] == "http://127.0.0.1:1"

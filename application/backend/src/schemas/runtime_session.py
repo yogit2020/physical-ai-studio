@@ -147,6 +147,157 @@ class DiscardEpisodeCommand(BaseModel):
     request_id: str
 
 
+HazardKind = Literal["none", "hand_or_person", "unknown_object", "other"]
+StoppableControl = Literal["model", "teleop"]
+
+
+class MonitorConfig(BaseModel):
+    """The vision-language model that watches the cameras and stops the control when it sees a hazard.
+
+    It speaks the OpenAI chat API (vLLM, say) and answers one word: ``SAFE``, ``UNSAFE_HAND`` or
+    ``UNSAFE_OBJECT``. See docs/feature_plans/remote-inference-and-safety-monitor.md.
+    """
+
+    enabled: bool = False
+    endpoint: str | None = None
+    """The API base, such as ``http://172.18.0.1:18766/v1``."""
+    model: str = "qwen-safety"
+    cameras: list[str] = Field(default_factory=list)
+    """Store camera keys to show the model, in order; empty shows every camera."""
+    check_hz: float = Field(
+        default=2.0, gt=0, le=10, description="Checks per second; a check still running is not doubled"
+    )
+    image_max_side: int = Field(default=448, ge=64, le=1920)
+    timeout_s: float = Field(default=3.0, gt=0, le=30)
+    min_confidence: float = Field(default=0.6, ge=0, le=1)
+    """An unsafe answer below this probability does not count."""
+    unsafe_consecutive: int = Field(default=1, ge=1, le=10)
+    fail_safe_after_s: float = Field(default=2.0, gt=0, le=60)
+    """Stop when no check has succeeded for this long while a control the monitor guards drives."""
+    max_frame_age_s: float = Field(default=1.0, gt=0, le=10)
+    """A frame older than this means a frozen camera: a failed check, not a safe one."""
+    prompt: str | None = None
+    """The scene description; ``None`` uses a generic one. The one-word answer instruction is added."""
+
+
+class SafetyConfig(BaseModel):
+    """What the session does when something reports a hazard. Kept per follower robot."""
+
+    monitor: MonitorConfig = Field(default_factory=MonitorConfig)
+
+    on_stop: Literal["home", "hold"] = "home"
+    """``home`` moves the follower to ``home_pose`` after stopping it; ``hold`` leaves it where it stopped."""
+    home_pose: list[float] | None = None
+    """In the follower's joint order and units; ``None`` until captured, and the follower then holds instead."""
+    home_duration_s: float = Field(default=4.0, gt=0, le=30, description="The move home takes at least this long")
+    max_joint_speed: float = Field(
+        45.0, gt=0, description="Joint units per second; a longer move home is slowed down to stay under it"
+    )
+    stop_controls: list[StoppableControl] = Field(default_factory=lambda: list[StoppableControl](["model"]))
+    """The controls a stop ends. Any other control keeps driving, and the follower is not moved."""
+
+
+class SafetyStopRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=500)
+    source: str = Field("api", min_length=1, max_length=100)
+    """Who reported the hazard: ``monitor``, ``gui``, or an external caller's own name."""
+    hazard: HazardKind = "other"
+    confidence: float | None = Field(None, ge=0, le=1)
+    hold: bool = False
+    """Freeze the follower where it is instead of moving it home; also interrupts a move home."""
+
+
+SafetyEventKind = Literal["stop", "acknowledge", "home_captured", "home", "config", "verdict", "monitor_fault"]
+
+
+class SafetyEvent(BaseModel):
+    id: str
+    at: UTCDatetime
+    kind: SafetyEventKind
+    source: str
+    hazard: HazardKind | None = None
+    reason: str | None = None
+    confidence: float | None = None
+    stopped_control: StoppableControl | None = None
+    """The control a stop ended, if one was running."""
+    motion: Literal["home", "hold", "none"] | None = None
+    """What the follower was told to do: move home, hold where it is, or nothing (another control drives it)."""
+    answer: str | None = None
+    """The monitor's one-word answer, for a verdict."""
+    latency_ms: float | None = None
+    frames: list[str] = Field(default_factory=list)
+    """Cameras whose frames were saved with a stop; fetch them from ``/safety/events/{id}/frames/{camera}``."""
+
+
+MonitorHealth = Literal["off", "ok", "degraded", "down"]
+
+
+class MonitorState(BaseModel):
+    health: MonitorHealth = "off"
+    """``degraded``: checks are failing but not for ``fail_safe_after_s`` yet; ``down``: they have been."""
+    guarding: bool = False
+    """Whether a control the monitor would stop is driving now."""
+    last_verdict: SafetyEvent | None = None
+    error: str | None = None
+
+
+SafetyLatchState = Literal["clear", "latched", "homing"]
+
+
+class SessionSafety(BaseModel):
+    state: SafetyLatchState
+    """``latched`` blocks starting a stopped control until a person acknowledges; ``homing`` is latched and moving."""
+    latched_by: SafetyEvent | None = None
+    home_pose_set: bool = False
+    monitor: MonitorState = MonitorState()
+
+
+class SafetyStatus(SessionSafety):
+    session_id: str
+    config: SafetyConfig
+    counters: dict[str, int]
+
+
+class SafetyMessage(BaseModel):
+    """A safety event, as it happens; the session's ``state`` follows with the new latch state."""
+
+    type: Literal["safety"] = "safety"
+    data: SafetyEvent
+
+
+class SafetyStopCommand(SafetyStopRequest):
+    command: Literal["safety_stop"] = "safety_stop"
+    request_id: str
+
+
+class SafetyAcknowledgeCommand(BaseModel):
+    """A person clears the latch. Nothing restarts on its own."""
+
+    command: Literal["safety_acknowledge"] = "safety_acknowledge"
+    request_id: str
+    source: str = "gui"
+
+
+class SetSafetyCommand(BaseModel):
+    command: Literal["set_safety"] = "set_safety"
+    request_id: str
+    config: SafetyConfig
+
+
+class CaptureHomeCommand(BaseModel):
+    """Take the follower's current position as its home pose."""
+
+    command: Literal["capture_home"] = "capture_home"
+    request_id: str
+
+
+class GoHomeCommand(BaseModel):
+    """Move the follower to its home pose now; refused while a control drives it."""
+
+    command: Literal["go_home"] = "go_home"
+    request_id: str
+
+
 class SetControlCommand(BaseModel):
     """Switch what drives the follower. ``null`` holds it where it is."""
 
@@ -166,7 +317,12 @@ RuntimeSessionCommand = Annotated[
     | UnloadModelCommand
     | StartEpisodeCommand
     | SaveEpisodeCommand
-    | DiscardEpisodeCommand,
+    | DiscardEpisodeCommand
+    | SafetyStopCommand
+    | SafetyAcknowledgeCommand
+    | SetSafetyCommand
+    | CaptureHomeCommand
+    | GoHomeCommand,
     Field(discriminator="command"),
 ]
 
@@ -236,6 +392,7 @@ class SessionState(BaseModel):
     """What drives the follower; ``None`` holds it still."""
     dataset: SessionDataset | None = None
     model: SessionModel | None = None
+    safety: SessionSafety = SessionSafety(state="clear")
 
 
 class StateMessage(BaseModel):
@@ -272,7 +429,7 @@ class StatusMessage(BaseModel):
     """Why it failed."""
 
 
-SessionEvent = Annotated[StateMessage | ErrorMessage, Field(discriminator="type")]
+SessionEvent = Annotated[StateMessage | ErrorMessage | SafetyMessage, Field(discriminator="type")]
 """What the session publishes on ``evt/session`` for its socket to forward."""
 
 
@@ -298,7 +455,7 @@ class ObservationMessage(BaseModel):
 
 
 RuntimeSessionServerMessage = Annotated[
-    AckMessage | StateMessage | ErrorMessage | StatusMessage | ObservationMessage,
+    AckMessage | StateMessage | ErrorMessage | StatusMessage | ObservationMessage | SafetyMessage,
     Field(discriminator="type"),
 ]
 

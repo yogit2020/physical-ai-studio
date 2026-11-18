@@ -1,0 +1,88 @@
+# Qwen safety monitor (vLLM, OpenAI API) at http://qwen-safety:8000/v1, model name "qwen-safety".
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qwen-models
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 40Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-safety
+  labels: {app.kubernetes.io/name: qwen-safety, app.kubernetes.io/part-of: physical-ai-studio}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}  # one GPU: the old pod must release it first
+  selector:
+    matchLabels: {app.kubernetes.io/name: qwen-safety}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: qwen-safety, app.kubernetes.io/part-of: physical-ai-studio}
+    spec:
+      resourceClaims:
+        - name: gpu
+          resourceClaimTemplateName: qwen-gpu
+      initContainers:
+        - name: fetch-model
+          image: qwen-safety
+          command: [python, -c]
+          args:
+            - |
+              import os, pathlib
+              from huggingface_hub import snapshot_download
+              target = pathlib.Path(os.environ["MODEL_PATH"])
+              if (target / "config.json").is_file():
+                  print(f"{target} present, skipping download")
+              else:
+                  snapshot_download(os.environ["MODEL_REPO"], local_dir=target, token=os.environ.get("HF_TOKEN") or None)
+          env:
+            - {name: MODEL_REPO, value: cyankiwi/Qwen3.8-27B-AWQ-INT4}
+            - {name: MODEL_PATH, value: /models/Qwen3.8-27B-AWQ-INT4}
+            - name: HF_TOKEN
+              valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+      containers:
+        - name: vllm
+          image: qwen-safety
+          env:
+            - {name: MODEL_PATH, value: /models/Qwen3.8-27B-AWQ-INT4}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            claims:
+              - name: gpu
+            requests: {cpu: "4", memory: 24Gi}
+          startupProbe:  # loading and profiling the model takes a few minutes
+            httpGet: {path: /v1/models, port: http}
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: {path: /v1/models, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: qwen-models}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen-safety
+spec:
+  selector: {app.kubernetes.io/name: qwen-safety}
+  ports:
+    - {name: http, port: 8000, targetPort: http}

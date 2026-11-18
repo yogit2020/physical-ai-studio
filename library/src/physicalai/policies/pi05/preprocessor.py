@@ -198,7 +198,7 @@ class Pi05Preprocessor(torch.nn.Module):
         # Discretize normalized state into 256 bins
         # NOTE: Do NOT pad state before discretization. Lerobot uses the raw
         # state dimensions (e.g. 8 for LIBERO) in the prompt, not max_state_dim.
-        state_np = state.cpu().numpy()
+        state_np = state.cpu().to(torch.float32).numpy()
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
         # Build full prompts with task + discretized state

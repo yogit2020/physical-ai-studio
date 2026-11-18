@@ -1,0 +1,15 @@
+# Pi0.5 policy server: the Studio image (same library and server script as Studio) with the
+# remote policy server as its entrypoint. Build from the repo root after building the Studio image:
+#   docker build -f deploy/docker/Dockerfile.pi05-policy-server \
+#     --build-arg STUDIO_IMAGE=ghcr.io/<owner>/physical-ai-studio-xpu:<tag> -t ghcr.io/<owner>/pi05-policy-server-xpu:<tag> .
+ARG STUDIO_IMAGE=ghcr.io/yogit2020/physical-ai-studio-xpu:remote-inference-safety
+FROM ${STUDIO_IMAGE}
+
+# Read-only at runtime: the init container downloads into the models volume first.
+ENV HF_HUB_OFFLINE=1 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 18767
+ENTRYPOINT ["python", "/app/application/backend/scripts/remote_policy_server.py"]
+CMD ["--export-dir", "/models/pi05/exports/torch", "--backend", "torch", "--device", "xpu", \
+     "--compile", "--warmup-synthetic", "--host", "0.0.0.0", "--port", "18767"]

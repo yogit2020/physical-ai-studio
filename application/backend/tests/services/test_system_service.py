@@ -20,6 +20,12 @@ def _device_props(name: str, total_memory: int) -> SimpleNamespace:
     return SimpleNamespace(name=name, total_memory=total_memory)
 
 
+@pytest.fixture(autouse=True)
+def no_remote_devices(monkeypatch):
+    """These tests are about local devices; remote servers are covered in test_remote_predictor."""
+    monkeypatch.setattr(SystemService, "_get_remote_inference_devices", staticmethod(list))
+
+
 def _device_summary(device):
     return device.backend, device.device, device.type, device.name, device.memory, device.index
 

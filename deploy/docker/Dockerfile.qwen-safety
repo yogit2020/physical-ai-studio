@@ -1,0 +1,16 @@
+# Qwen safety monitor: vLLM for Intel XPU serving a vision-language model as "qwen-safety"
+# with the settings tested on an Arc Pro B70 (one request at a time, two images per prompt).
+#   docker build -f deploy/docker/Dockerfile.qwen-safety -t ghcr.io/<owner>/qwen-safety-xpu:<tag> .
+FROM vllm/vllm-openai-xpu:v0.32.0
+
+COPY deploy/docker/qwen-safety-entrypoint.sh /usr/local/bin/qwen-safety-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/qwen-safety-entrypoint.sh
+
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    MODEL_PATH=/models/Qwen3.8-27B-AWQ-INT4 \
+    SERVED_MODEL_NAME=qwen-safety \
+    GPU_MEMORY_UTILIZATION=0.80 \
+    MAX_MODEL_LEN=2048
+
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/qwen-safety-entrypoint.sh"]

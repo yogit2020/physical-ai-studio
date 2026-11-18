@@ -222,6 +222,10 @@ class Settings(BaseSettings):
     environment: Literal["dev", "prod"] = "dev"
     storage_dir: Path = Field(default_factory=get_default_storage_dir, alias="STORAGE_DIR")
     static_files_dir: str | None = Field(default=None, alias="STATIC_FILES_DIR")
+    safety_monitor_endpoint: str | None = Field(default=None, alias="SAFETY_MONITOR_ENDPOINT")
+    """The safety monitor's API base (``http://qwen-safety:8000/v1``) for followers that have none set."""
+    safety_monitor_prompt: str | None = Field(default=None, alias="SAFETY_MONITOR_PROMPT")
+    """The scene description for followers whose monitor has no prompt set."""
 
     @property
     def version(self) -> str:
