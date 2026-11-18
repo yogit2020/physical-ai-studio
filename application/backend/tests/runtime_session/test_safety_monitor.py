@@ -208,3 +208,29 @@ async def test_setting_the_monitor_keeps_the_home_pose(new_session, fake_cameras
     assert status.config.home_pose == [1.0, 2.0]
     assert status.config.monitor.enabled is False
     await _until(lambda: session.state().safety.monitor.health == "off")
+
+
+async def test_switching_the_monitor_off_and_on_keeps_its_settings(new_session, fake_cameras, tmp_path, vlm) -> None:
+    session = await _session(new_session, tmp_path, vlm, drive=False, prompt="the white mat")
+
+    await session.set_safety(SafetyConfig.model_validate({"monitor": {"enabled": False}}))
+    status = await session.set_safety(SafetyConfig.model_validate({"monitor": {"enabled": True}}))
+
+    assert status.config.monitor.enabled is True
+    assert (status.config.monitor.endpoint, status.config.monitor.prompt) == (vlm.endpoint, "the white mat")
+    assert status.config.monitor.check_hz == 10
+
+
+async def test_a_monitor_without_an_endpoint_uses_the_server_default(
+    new_session, fake_cameras, tmp_path, vlm, monkeypatch
+) -> None:
+    monkeypatch.setenv("SAFETY_MONITOR_ENDPOINT", vlm.endpoint)
+    monkeypatch.setenv("SAFETY_MONITOR_PROMPT", "the deployed scene prompt")
+    session = await _session(new_session, tmp_path, vlm, drive=False, endpoint=None)
+    since = len(vlm.requests)
+
+    await _until(lambda: len(vlm.requests) > since)
+
+    assert session.safety_status().config.monitor.endpoint is None  # the follower's own setting is untouched
+    assert session.state().safety.monitor.last_verdict.answer == "SAFE"
+    assert vlm.requests[-1]["messages"][0]["content"][-1]["text"].startswith("the deployed scene prompt")

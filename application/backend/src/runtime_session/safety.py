@@ -58,9 +58,18 @@ class SafetyLatch:
             self.config = SafetyConfig()
 
     def configure(self, config: SafetyConfig, *, source: str) -> SafetyEvent:
-        """Take ``config``; fields it leaves unset keep their current values, so a home pose survives."""
+        """Take ``config``; fields it leaves unset keep their current values, so a home pose survives.
+
+        The same holds inside ``monitor``: ``{"monitor": {"enabled": false}}`` keeps its endpoint and prompt.
+        """
         unset = set(SafetyConfig.model_fields) - config.model_fields_set
-        self.config = config.model_copy(update={name: getattr(self.config, name) for name in unset})
+        update = {name: getattr(self.config, name) for name in unset}
+        if "monitor" in config.model_fields_set:
+            monitor_unset = set(type(config.monitor).model_fields) - config.monitor.model_fields_set
+            update["monitor"] = config.monitor.model_copy(
+                update={name: getattr(self.config.monitor, name) for name in monitor_unset}
+            )
+        self.config = config.model_copy(update=update)
         self._save()
         return self.record("config", source=source)
 

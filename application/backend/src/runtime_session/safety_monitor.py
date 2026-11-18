@@ -32,6 +32,7 @@ import httpx
 from loguru import logger
 
 from schemas.runtime_session import MonitorState, SafetyEvent, SafetyStopRequest
+from settings import get_settings
 from utils.jpeg import encode_jpeg_rgb
 
 if TYPE_CHECKING:
@@ -94,6 +95,9 @@ class SafetyMonitor:
         self.state = MonitorState()
         self._client: httpx.AsyncClient | None = None
         self._endpoint: str | None = None
+        settings = get_settings()
+        self._defaults = {"endpoint": settings.safety_monitor_endpoint, "prompt": settings.safety_monitor_prompt}
+        """For a follower whose monitor has none of its own (``SAFETY_MONITOR_ENDPOINT`` / ``_PROMPT``)."""
         self._unsafe_streak = 0
         self._last_ok: float | None = None
         """``time.monotonic()`` of the last check that gave a verdict, while guarding."""
@@ -105,6 +109,11 @@ class SafetyMonitor:
         try:
             while True:
                 config = self._hooks.config()
+                defaults = {
+                    name: value for name, value in self._defaults.items() if value and not getattr(config, name)
+                }
+                if defaults:
+                    config = config.model_copy(update=defaults)
                 store = self._hooks.store()
                 if not config.enabled or not config.endpoint or store is None:
                     self._idle()
