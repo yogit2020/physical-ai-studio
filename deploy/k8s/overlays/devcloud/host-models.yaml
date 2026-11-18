@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-safety
+spec:
+  template:
+    spec:
+      volumes:
+        - name: models
+          persistentVolumeClaim: null
+          hostPath: {path: /home/devcloud/yogini/qwen-safety/models, type: Directory}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pi05-policy
+spec:
+  template:
+    spec:
+      containers:
+        - name: server
+          volumeMounts:
+            - {name: models, mountPath: /models, $patch: delete}
+            - {name: pi05-exports, mountPath: /models/pi05/exports, readOnly: true}
+            - {name: hf-cache, mountPath: /models/hf-cache, readOnly: true}
+      volumes:
+        - {name: models, $patch: delete}
+        - name: pi05-exports
+          hostPath: {path: /home/devcloud/yogini/pi05-210base-65ft/exports, type: Directory}
+        - name: hf-cache
+          hostPath: {path: /home/devcloud/yogini/bench/pg_cache, type: Directory}

@@ -1,0 +1,29 @@
+# Run Studio on the node the robot arms and cameras are plugged into, with access to them.
+# Label that node first: kubectl label node <node> physical-ai-studio/robot=true
+# Like the Docker Compose default, this runs Studio privileged (serial ports, cameras, RealSense USB).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - target: {kind: Deployment, name: physical-ai-studio}
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: physical-ai-studio
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              physical-ai-studio/robot: "true"
+            containers:
+              - name: studio
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - {name: host-dev, mountPath: /dev}
+                  - {name: calibration, mountPath: /home/appuser/.cache/huggingface/lerobot/calibration, readOnly: true}
+            volumes:
+              - name: host-dev
+                hostPath: {path: /dev}
+              - name: calibration  # the arms' LeRobot calibration on that node
+                hostPath: {path: /home/appuser/.cache/huggingface/lerobot/calibration, type: DirectoryOrCreate}

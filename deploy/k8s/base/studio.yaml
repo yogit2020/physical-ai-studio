@@ -1,0 +1,84 @@
+# Physical AI Studio (UI + backend) at http://physical-ai-studio:7860.
+# It runs the policy on pi05-policy (device "remote" in the model load dialog) and the safety
+# monitor on qwen-safety. Robot arms and cameras need the components/robot-node component.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: studio-storage
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: physical-ai-studio
+  labels: {app.kubernetes.io/name: physical-ai-studio, app.kubernetes.io/part-of: physical-ai-studio}
+spec:
+  replicas: 1  # one SQLite database and one robot: never more than one
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: physical-ai-studio}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: physical-ai-studio, app.kubernetes.io/part-of: physical-ai-studio}
+    spec:
+      securityContext:
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 60  # a follower arm parks before the worker exits
+      initContainers:
+        # Seed the remote server config once; Studio rewrites it when you change a server in the UI.
+        - name: seed-remote-inference
+          image: physical-ai-studio
+          command: [sh, -c]
+          args:
+            - test -f /app/storage/remote_inference.json || cp /seed/remote_inference.json /app/storage/remote_inference.json
+          volumeMounts:
+            - {name: storage, mountPath: /app/storage}
+            - {name: seed, mountPath: /seed, readOnly: true}
+      containers:
+        - name: studio
+          image: physical-ai-studio
+          env:
+            - {name: HOST, value: 0.0.0.0}
+            - {name: PORT, value: "7860"}
+            # Used for any follower whose safety monitor has no endpoint / prompt saved of its own.
+            - {name: SAFETY_MONITOR_ENDPOINT, value: "http://qwen-safety:8000/v1"}
+            - name: SAFETY_MONITOR_PROMPT
+              valueFrom: {configMapKeyRef: {name: studio-safety, key: scene-prompt.txt}}
+          ports:
+            - {name: http, containerPort: 7860}
+          resources:
+            requests: {cpu: "2", memory: 8Gi}
+          startupProbe:
+            httpGet: {path: /api/health, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /api/health, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /api/health, port: http}
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - {name: storage, mountPath: /app/storage}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - name: storage
+          persistentVolumeClaim: {claimName: studio-storage}
+        - name: seed
+          configMap: {name: studio-remote-inference}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 4Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: physical-ai-studio
+spec:
+  selector: {app.kubernetes.io/name: physical-ai-studio}
+  ports:
+    - {name: http, port: 7860, targetPort: http}

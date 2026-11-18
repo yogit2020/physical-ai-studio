@@ -1,0 +1,33 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: qwen-gpu
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          exactly:
+            deviceClassName: gpu.intel.com
+            allocationMode: ExactCount
+            count: 1
+            adminAccess: true
+            selectors:
+              - cel: {expression: 'device.attributes["resource.kubernetes.io"].pciBusID == "0000:18:00.0"'}
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: pi05-gpu
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          exactly:
+            deviceClassName: gpu.intel.com
+            allocationMode: ExactCount
+            count: 1
+            adminAccess: true
+            selectors:
+              - cel: {expression: 'device.attributes["resource.kubernetes.io"].pciBusID == "0000:54:00.0"'}

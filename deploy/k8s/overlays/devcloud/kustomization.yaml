@@ -1,0 +1,30 @@
+# Intel DevCloud B70 host (single node, 2 x Arc Pro B70). Both GPUs are already allocated to other
+# workloads there, so each server takes a fixed card with an admin-access claim, the way the node's
+# GPU monitor does: Qwen on 0000:18:00.0 (card1), Pi0.5 on 0000:54:00.0 (card2). The models are the
+# copies already on the host, so nothing is downloaded.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: namespace-admin-access.yaml
+  - path: gpu-claims.yaml
+  - path: host-models.yaml
+  - target: {kind: Deployment, name: qwen-safety}
+    patch: |-
+      - {op: remove, path: /spec/template/spec/initContainers}
+  - target: {kind: Deployment, name: pi05-policy}
+    patch: |-
+      - {op: remove, path: /spec/template/spec/initContainers}
+  - target: {kind: PersistentVolumeClaim, name: qwen-models}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: qwen-models}
+  - target: {kind: PersistentVolumeClaim, name: pi05-models}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: pi05-models}
