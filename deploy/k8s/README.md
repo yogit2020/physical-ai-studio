@@ -20,7 +20,6 @@ deploy/
   docker/Dockerfile.pi05-policy-server   Studio image + remote_policy_server.py as entrypoint
   docker/Dockerfile.qwen-safety          vLLM XPU + qwen-safety-entrypoint.sh
   k8s/base/                              portable manifests (GPUs via DRA, models downloaded into PVCs)
-  k8s/overlays/devcloud/                 Intel DevCloud B70 host: fixed cards, models already on disk
   k8s/components/robot-node/             optional: Studio on the node with the arm and cameras
 ```
 
@@ -30,7 +29,7 @@ deploy/
 - The [Intel GPU resource driver](https://github.com/intel/intel-resource-drivers-for-kubernetes),
   which provides DeviceClass `gpu.intel.com`. Check: `kubectl get deviceclass gpu.intel.com`.
 - Two free Intel GPUs with at least 24 GB each (tested on Arc Pro B70, 32 GB). Qwen takes ~26 GB, Pi0.5 ~9 GB.
-- A default StorageClass for the PVCs (~110 GB in total), or the devcloud overlay's host paths.
+- A default StorageClass for the PVCs (~110 GB in total).
 - A Hugging Face token with access to the gated `google/paligemma-3b-pt-224` (Pi0.5's tokenizer).
 - The host GID of `render` (`getent group render`). The base uses 990; change
   `supplementalGroups` in `base/pi05-policy.yaml` if yours differs.
@@ -106,44 +105,32 @@ kubectl label node <node> physical-ai-studio/robot=true
 ```
 
 ```yaml
-# deploy/k8s/overlays/<yours>/kustomization.yaml
-resources: [../../base]
-components: [../../components/robot-node]
+# your own kustomization.yaml, e.g. deploy/k8s/my-cluster/kustomization.yaml
+resources: [../base]
+components: [../components/robot-node]
 ```
 
 Edit the calibration host path in `components/robot-node/kustomization.yaml` to where the arms'
 LeRobot calibration lives on that node. Without the component, Studio runs but sees no robot or camera.
 
-## 4. Deploy on the Intel DevCloud B70 host
+## 4. Tested
 
-Both B70s on that host are already allocated to other workloads in Kubernetes, so the overlay gives each
-server a fixed card with an admin-access claim (as the host's GPU monitor does) and uses the models
-already on disk:
-
-| Server | Card | PCI | Models |
-|---|---|---|---|
-| `qwen-safety` | `card1` / `renderD128` | `0000:18:00.0` | `/home/devcloud/yogini/qwen-safety/models` |
-| `pi05-policy` | `card2` / `renderD129` | `0000:54:00.0` | `/home/devcloud/yogini/pi05-210base-65ft/exports`, tokenizer in `/home/devcloud/yogini/bench/pg_cache` |
-
-```bash
-kubectl apply -k deploy/k8s/overlays/devcloud
-```
-
-The Docker containers that use the same cards (`yogini-qwen-safety`, `yogini-pi05-torch`,
-`yogini-pi05-server`) must be stopped first: the GPUs do not have the memory for both.
-
-**Tested 2026-11-18** (images `18d8c6ec` and `vllm-v0.32.0`, Kubernetes 1.34, Intel GPU DRA driver):
+2026-11-18 on a single-node Kubernetes 1.34 cluster with 2 x Arc Pro B70 and the Intel GPU DRA driver
+(images `18d8c6ec` and `vllm-v0.32.0`):
 
 | Check | Result |
 |---|---|
-| Scheduling | all 3 pods on the node; both claims allocated with admin access to the intended cards |
-| GPU isolation | `qwen-safety` sees only `card1`/`renderD128`, `pi05-policy` only `card2`/`renderD129` |
+| Scheduling | all 3 pods on the node; one GPU claim allocated per server |
+| GPU isolation | each server sees only its own card (`/dev/dri/card*` + `renderD*`) |
 | Start-up | Studio Ready in < 20 s; Pi0.5 load 101 s + compile warm-up 176 s (`--warmup-synthetic`); Qwen Ready in < 5 min |
 | Pi0.5 from the Studio pod | `/info` fingerprint `c8af1928…` (same weights as before); `(50, 6)` actions, **84 ms** on the GPU, **90 ms** round trip (median of 22) |
 | Qwen from the Studio pod | model `qwen-safety`; one-word check `SAFE`, **240 ms** median (first call 1.6 s) |
 | Studio | `/api/health` healthy; server preset `pi05-policy:18767`; Test connection OK (12 ms); `SAFETY_MONITOR_ENDPOINT` and the scene prompt set |
 
-Not tested there: a robot (none on that host), model import, and a real run with the safety monitor.
+Both GPUs on that cluster were already allocated to other workloads, so the test pinned each server to
+a fixed card (an admin-access claim with a PCI selector) and mounted the models from the host instead of
+downloading them. Not exercised there: the base's claims for a free GPU, the `fetch-model` downloads,
+a robot (none on that cluster), model import, and a real run with the safety monitor.
 
 ## 5. Use it
 
@@ -190,7 +177,7 @@ kubectl $NS exec deploy/physical-ai-studio -- python -c \
 ## 7. Remove
 
 ```bash
-kubectl delete -k deploy/k8s/base          # or overlays/devcloud
+kubectl delete -k deploy/k8s/base
 ```
 
 This deletes the PVCs too, with Studio's database and the downloaded models (`local-path` reclaims with

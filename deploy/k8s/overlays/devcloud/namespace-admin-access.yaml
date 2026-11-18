@@ -1,7 +1,0 @@
-# Admin-access claims are only allowed in a namespace with this label.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: physical-ai-studio
-  labels:
-    resource.kubernetes.io/admin-access: "true"
